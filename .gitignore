@@ -1,0 +1,7 @@
+node_modules/
+*.log
+.DS_Store
+
+# 状态文件里有密码哈希与访客名单，绝不进仓库
+admin-gate.json
+.credentials.yaml
