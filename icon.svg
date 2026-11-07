@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="管理员密码">
+  <defs>
+    <linearGradient id="agGateBody" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3d8fd6"/>
+      <stop offset="1" stop-color="#1c5f96"/>
+    </linearGradient>
+  </defs>
+  <!-- 门框 -->
+  <rect x="6" y="8" width="52" height="48" rx="9" fill="url(#agGateBody)"/>
+  <rect x="12" y="14" width="40" height="36" rx="6" fill="#0f2f4c" opacity="0.35"/>
+  <!-- 钥匙孔 = 密码 -->
+  <circle cx="32" cy="28" r="7.5" fill="#f4f9ff"/>
+  <path d="M32 34 L28.6 44 h6.8 Z" fill="#f4f9ff"/>
+  <!-- 两条横杠 = 名单 / 关卡 -->
+  <rect x="15" y="47.5" width="9" height="3" rx="1.5" fill="#9fd0ff" opacity="0.9"/>
+  <rect x="27.5" y="47.5" width="9" height="3" rx="1.5" fill="#9fd0ff" opacity="0.6"/>
+  <rect x="40" y="47.5" width="9" height="3" rx="1.5" fill="#9fd0ff" opacity="0.35"/>
+</svg>
