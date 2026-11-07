@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Admin Password",
+    "description": "A gate before Harness: admins enter with a password, guests enter without one and get only the endpoints and tools on an allowlist."
+  }
+}
