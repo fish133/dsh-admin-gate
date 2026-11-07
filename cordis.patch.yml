@@ -1,0 +1,8 @@
+# 管理员密码（admin-gate）
+#
+# 一条 host entry + 一个 browser 半边（package.json 的 dsh.client）。
+# 密码、访客名单这类运行时状态存在 $DSH_HOME/admin-gate.json 里，不进 profile
+# patch —— 改密码走设置页的「管理员密码」分区，而不是手改 yml。
+- insert:
+    - id: admin-gate
+      name: '@local/dsh-admin-gate'
