@@ -1,37 +1,51 @@
 // 管理员密码（admin-gate）—— host 半边
 //
-// 目标：进 Harness 之前先过一道门。
+// 进 Harness 之前先过一道门：
 //   · 管理员：输密码进去，能力全开。
 //   · 访客：不输密码，按名单放行接口与工具。
+//   · 无访客：门只给管理员开，访客入口整个关掉。
+//   · 多账号：可以有好几个管理员账号，各自独立密码。
 //
-// 为什么不是「客户端弹个遮罩」：
-//   遮罩只能挡住眼睛，挡不住手 —— 页面里的 /api 照样能调。所以真正的闸门放在
-//   host 这边：没通过闸门的浏览器请求一律拿不到 /api；访客的 /api 端点还要再过
-//   一遍白名单。页面跳一下只是外表，服务端这份拒绝才是本体。
+// 为什么闸门在 host 而不在客户端：
+//   客户端弹个遮罩只挡眼睛，页面里的 fetch('/api/...') 照样能发。真正的拒绝
+//   在服务端：没过闸门的浏览器拿不到 /api，访客的端点还要再过一遍白名单。
+//   页面跳一下是外表，服务端这份拒绝才是本体。
 //
 // 闸门页自己必须「不用登录也能打开」，所以它不挂在 /api 下，而是 /admin-gate/*
-// 这组自有路由（HTML + JSON），也不依赖 Harness 的 cookie。
+// 这一组自有路由（HTML + JSON），也不依赖 Harness 的 cookie。
 //
-// 密码不写在 profile patch 里（改了要重启、还会被别的层覆盖），而是落在
-// $DSH_HOME/admin-gate.json 里，存 scrypt 加盐哈希。改密码走闸门页的「管理员设置」
-// 或 Web 设置页里的「管理员密码」分区。
+// 状态存 $DSH_HOME/admin-gate.json（scrypt 加盐哈希），不进 profile patch ——
+// patch 会被升级覆盖，密码不该跟着漂。
 
 import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile, rename } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 export const name = 'admin-gate';
-// 路由要挂在 webServer 上；connection / tools 都是可选的，不写进 inject，
+// 路由挂在 webServer 上；connection / tools 都是可选的，不写进 inject，
 // 免得在没装它们的组合里整个插件不激活。
 export const inject = ['webServer'];
 
 const COOKIE = 'dsh-admin-gate';
 const ROUTE = '/admin-gate';
-const STATE_VERSION = 1;
+const STATE_VERSION = 2;
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const SCRYPT = { n: 16384, r: 8, p: 1, len: 64 };
+
+/** 登录失败后的冷却。 */
+const MAX_FAILURES = 5;
+const FAILURE_WINDOW_MS = 10 * 60 * 1000;
+const LOCKOUT_MS = 5 * 60 * 1000;
+
+/**
+ * 门的三种模式：
+ *   admin-only —— 只给管理员开，访客入口关闭（无访客模式）
+ *   guest      —— 管理员 + 访客（访客按名单）
+ *   open       —— 闸门停用，谁都能直接进（等于关掉这个插件）
+ */
+const MODES = ['admin-only', 'guest', 'open'];
 
 /**
  * 访客默认能调的 /api 端点：能看见工作区、会话和模型目录，改不了一样。
@@ -42,51 +56,50 @@ const SCRYPT = { n: 16384, r: 8, p: 1, len: 64 };
  *
  * 这份名单要**够页面正常启动**：前端一加载就会问会话、模型目录、插件清单、
  * 传输恢复参数，少一个就是一屏红字（"Failed to load plugins" 就是这么来的）。
- * 所以这里收的是「页面开得起来所需要的最小集合」，工具权限另算。
  */
 const DEFAULT_GUEST_ENDPOINTS = [
-  // 会话与工作区（看得到，改不了）
   'session/list', 'session/page', 'session/follow', 'session/projections',
   'session/modelCatalog', 'session/search', 'session/attachment',
   'session/listMetadata', 'session/canOpenWorkspacePath',
   'workspace/follow', 'workspaceFiles/read', 'workspaceFiles/readBytes',
   'workspaceFiles/list', 'workspaceFiles/stat', 'workspaceFiles/changes',
-  // 页面开起来要用的目录类查询
   'job/list', 'job/follow', 'schedule/list', 'skills/list',
   'agentPresets/list', 'agentPresets/read', 'settings/describe',
   'llm/listProviders', 'llm/listConfigurableProviders', 'fileReferences/list',
   'messageFeedback/list', 'remoteAccess/follow', 'account/getState',
   'pluginManager/listBundles', 'pluginManager/listPlugins',
   'pluginManager/registries', 'pluginInventory/list',
-  // 思维链翻译小部件：前端启动时一定会问它，拦掉就是「插件加载失败」
   'cotTranslation/limits', 'cotTranslation/translate',
 ];
 
 /**
  * 访客默认能用的工具：只留联网查资料。
  *
- * 不默认给 read / glob / grep / read_image / bash / write：它们是**主人身份**在
- * 这台机器上跑的工具，read 能读 ~/.dsh 里的凭据，bash 能跑任何命令。访客要
- * 这些得主人自己往名单里加，默认值不替他把门打开。
+ * 不默认给 read / glob / grep / bash / write：它们是**主人身份**在这台机器上
+ * 跑的工具，read 能读 ~/.dsh 里的凭据，bash 能跑任何命令。
  */
 const DEFAULT_GUEST_TOOLS = ['web_search', 'web_fetch'];
 
 /**
  * 一条端点是否放行给访客。
  *
- * 名单里的字面量优先；另外认 `*`（整个命名空间）与结尾的 `*` 通配，
- * 这样主人不用一条条列。写成函数是因为这套判断现在有两个调用点
- * （HTTP 一份、WS 一份），规则只能有一处。
- * @param {string[]} endpoints - 主人配置的名单。
- * @param {string} endpoint - 例如 `session/list`。
+ * 支持三种写法：
+ *   `session/list`   精确匹配
+ *   `session/*`      前缀通配（`*` 在末尾、前缀非空）
+ *   `*`              全放行
+ *
+ * 中间通配（`a*b`）**不支持** —— 旧实现里它会把 `ab` 也放过去，是个漏洞。
+ * 遇到这种写法当字面量处理，不猜主人想干什么。
  */
 function guestAllows(endpoints, endpoint) {
   for (const pattern of endpoints) {
+    if (typeof pattern !== 'string' || pattern === '') continue;
     if (pattern === endpoint) return true;
-    if (!pattern.includes('*')) continue;
-    const prefix = pattern.slice(0, pattern.indexOf('*'));
-    if (pattern.endsWith('*') && endpoint.startsWith(prefix)) return true;
-    if (pattern.indexOf('*') === pattern.length - 2 && endpoint === prefix + pattern.at(-1)) return true;
+    if (pattern === '*') return true;
+    if (pattern.endsWith('*') && !pattern.slice(0, -1).includes('*')) {
+      const prefix = pattern.slice(0, -1);
+      if (prefix !== '' && endpoint.startsWith(prefix)) return true;
+    }
   }
   return false;
 }
@@ -98,13 +111,12 @@ function statePath() {
   return join(home, 'admin-gate.json');
 }
 
+/** 一份全新的状态。 */
 function emptyState() {
   return {
     version: STATE_VERSION,
-    password: null,
-    // `customized` = 主人动过这份名单。没动过就跟着 DEFAULT 走，
-    // 这样插件升级补了新端点（前端要用的那些）能自动补上，不至于
-    // 主人什么都没改、却因为旧名单缺一条而白屏。
+    mode: 'admin-only',
+    accounts: {},
     guest: {
       endpoints: [...DEFAULT_GUEST_ENDPOINTS],
       tools: [...DEFAULT_GUEST_TOOLS],
@@ -113,26 +125,64 @@ function emptyState() {
   };
 }
 
+/**
+ * 把 v1 老状态（单个 password）迁成 v2（accounts 表）。
+ * @param {any} parsed - 磁盘上读到的原始对象。
+ */
+function migrate(parsed) {
+  const base = emptyState();
+  const version = Number(parsed?.version) || 1;
+
+  let accounts = {};
+  if (version < 2) {
+    // v1 → v2：{ password: {...} } 变成一个叫「管理员」的账号
+    if (parsed?.password && typeof parsed.password.hash === 'string') {
+      accounts = {
+        [randomBytes(8).toString('hex')]: {
+          name: '管理员',
+          salt: parsed.password.salt,
+          hash: parsed.password.hash,
+          n: parsed.password.n,
+          r: parsed.password.r,
+          p: parsed.password.p,
+          createdAt: Date.now(),
+        },
+      };
+    }
+  } else if (parsed?.accounts && typeof parsed.accounts === 'object') {
+    accounts = parsed.accounts;
+  }
+
+  const mode = MODES.includes(parsed?.mode) ? parsed.mode : 'admin-only';
+  const customized = parsed?.guest?.customized === true;
+
+  return {
+    version: STATE_VERSION,
+    mode,
+    accounts,
+    guest: {
+      endpoints: customized && Array.isArray(parsed?.guest?.endpoints)
+        ? parsed.guest.endpoints
+        : base.guest.endpoints,
+      tools: customized && Array.isArray(parsed?.guest?.tools)
+        ? parsed.guest.tools
+        : base.guest.tools,
+      customized,
+    },
+  };
+}
+
 async function loadState() {
   try {
     const raw = await readFile(statePath(), 'utf8');
     const parsed = JSON.parse(raw);
-    const base = emptyState();
-    const customized = parsed.guest?.customized === true;
-    return {
-      version: STATE_VERSION,
-      password: parsed.password ?? null,
-      guest: {
-        // 没自定义过就跟默认值（升级自动补齐）；自定义过就完全照主人的来。
-        endpoints: customized
-          ? (Array.isArray(parsed.guest.endpoints) ? parsed.guest.endpoints : base.guest.endpoints)
-          : base.guest.endpoints,
-        tools: customized
-          ? (Array.isArray(parsed.guest.tools) ? parsed.guest.tools : base.guest.tools)
-          : base.guest.tools,
-        customized,
-      },
-    };
+    const state = migrate(parsed);
+    // 老版本读进来是迁过的：顺手写回去，否则每次启动都要再迁一遍，
+    // 而且磁盘上一直是旧格式，排查时容易看错。
+    if (Number(parsed?.version) !== STATE_VERSION) {
+      try { await saveState(state); } catch { /* 写不进去也不影响本次使用 */ }
+    }
+    return state;
   } catch (error) {
     if (error?.code !== 'ENOENT') {
       console.warn('[admin-gate] 状态文件读不动，按未设置处理：%s', error?.message ?? error);
@@ -141,10 +191,29 @@ async function loadState() {
   }
 }
 
+/**
+ * 写状态：先写临时文件再 rename，避免写到一半断电留下半个 json。
+ */
 async function saveState(state) {
   const path = statePath();
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const tmp = `${path}.${process.pid}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  await rename(tmp, path);
+}
+
+/** 有没有设置过密码的账号。 */
+function hasAccounts(state) {
+  return Object.keys(state.accounts ?? {}).length > 0;
+}
+
+/** 账号表 -> UI 用的精简列表。 */
+function accountList(state) {
+  return Object.entries(state.accounts ?? {}).map(([id, account]) => ({
+    id,
+    name: typeof account?.name === 'string' && account.name !== '' ? account.name : '管理员',
+    createdAt: Number(account?.createdAt) || 0,
+  })).sort((a, b) => a.createdAt - b.createdAt);
 }
 
 // ------------------------------------------------------------- 密码哈希
@@ -173,21 +242,47 @@ function verifyPassword(password, record) {
   }
 }
 
+/**
+ * 拿一个密码去所有账号里试，命中就返回那个账号。
+ * 不短路：所有账号都要比完，免得靠响应时间猜出"第几个账号对了"。
+ * @returns {{ id: string, name: string } | undefined}
+ */
+function matchAccount(state, password) {
+  let hit;
+  for (const [id, account] of Object.entries(state.accounts ?? {})) {
+    if (verifyPassword(password, account)) {
+      hit ??= { id, name: account.name ?? '管理员' };
+    }
+  }
+  return hit;
+}
+
 // --------------------------------------------------------------- HTTP 小工具
 
+/**
+ * 从 Cookie 头里取一个值。
+ * 解码失败（畸形百分号编码）不抛异常——返回原样字符串，让上层比对时自然不认。
+ * 旧实现这里会抛 URIError，一个畸形 cookie 就能让整个请求 500。
+ */
 function readCookie(req, key) {
-  const header = req.headers.cookie;
+  const header = req.headers?.cookie;
   if (typeof header !== 'string') return undefined;
   for (const part of header.split(';')) {
     const at = part.indexOf('=');
     if (at === -1) continue;
     if (part.slice(0, at).trim() !== key) continue;
-    return decodeURIComponent(part.slice(at + 1).trim());
+    const raw = part.slice(at + 1).trim();
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
   }
   return undefined;
 }
 
 function sendJson(res, status, value, extraHeaders = {}) {
+  if (res.headersSent) return;
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
@@ -197,6 +292,7 @@ function sendJson(res, status, value, extraHeaders = {}) {
 }
 
 function sendHtml(res, status, html) {
+  if (res.headersSent) return;
   res.writeHead(status, {
     'content-type': 'text/html; charset=utf-8',
     'cache-control': 'no-store',
@@ -214,7 +310,8 @@ async function readJsonBody(req, limit = 64 * 1024) {
   }
   if (chunks.length === 0) return {};
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    return parsed !== null && typeof parsed === 'object' ? parsed : {};
   } catch {
     throw new Error('请求体不是 JSON');
   }
@@ -224,41 +321,52 @@ function cookieHeader(token, maxAgeSeconds) {
   return `${COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}`;
 }
 
+function clearCookieHeader() {
+  return `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
+}
+
 // ------------------------------------------------------------------ 闸门页
 
 const GATE_CSS = `
-  :root { color-scheme: light dark; --fg:#1b1f24; --dim:#6b7480; --bg:#f6f7f9; --card:#fff; --line:#dfe3e8; --brand:#247bbf; --err:#c0392b; }
-  @media (prefers-color-scheme: dark) { :root { --fg:#e8eaed; --dim:#9aa3ad; --bg:#16181c; --card:#1e2126; --line:#31363d; --brand:#5aa9e6; --err:#ff7b6b; } }
+  :root { color-scheme: light dark; --fg:#1b1f24; --dim:#6b7480; --bg:#f6f7f9; --card:#fff; --line:#dfe3e8; --brand:#247bbf; --err:#c0392b; --ok:#2e9e5b; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#e8eaed; --dim:#9aa3ad; --bg:#16181c; --card:#1e2126; --line:#31363d; --brand:#5aa9e6; --err:#ff7b6b; --ok:#4ec97f; } }
   * { box-sizing: border-box; }
   body { margin:0; min-height:100vh; display:grid; place-items:center; padding:24px 16px; background:var(--bg); color:var(--fg);
          font:15px/1.6 system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
-  .card { width:min(440px, 100%); background:var(--card); border:1px solid var(--line);
+  .card { width:min(460px, 100%); background:var(--card); border:1px solid var(--line);
           border-radius:14px; padding:26px 24px 20px; box-shadow:0 10px 40px rgb(0 0 0 / .08); }
   h1 { margin:0 0 4px; font-size:19px; letter-spacing:.2px; }
+  h2 { font-size:14px; margin:0 0 12px; color:var(--fg); }
   .sub { margin:0 0 18px; color:var(--dim); font-size:13px; }
   .tabs { display:flex; gap:8px; margin-bottom:16px; }
   .tabs button { flex:1; padding:9px 0; border-radius:9px; border:1px solid var(--line); background:transparent;
                  color:var(--fg); font:inherit; font-size:13px; cursor:pointer; }
   .tabs button[aria-selected="true"] { border-color:var(--brand); color:var(--brand); font-weight:600; }
+  .tabs button:disabled { opacity:.4; cursor:not-allowed; }
   label { display:block; font-size:13px; color:var(--dim); margin:0 0 6px; }
-  input, textarea { width:100%; padding:10px 12px; border-radius:9px; border:1px solid var(--line);
+  input, select, textarea { width:100%; padding:10px 12px; border-radius:9px; border:1px solid var(--line);
           background:transparent; color:var(--fg); font:inherit; }
   textarea { min-height:88px; resize:vertical; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
-  input:focus, textarea:focus { outline:2px solid color-mix(in srgb, var(--brand) 45%, transparent); outline-offset:1px; border-color:var(--brand); }
+  select { cursor:pointer; }
+  input:focus, select:focus, textarea:focus { outline:2px solid color-mix(in srgb, var(--brand) 45%, transparent); outline-offset:1px; border-color:var(--brand); }
   .row { margin-bottom:14px; }
   .go { width:100%; padding:11px 0; border-radius:9px; border:0; background:var(--brand); color:#fff;
         font:inherit; font-weight:600; cursor:pointer; }
   .go:disabled { opacity:.55; cursor:default; }
   .ghost { padding:8px 14px; border-radius:8px; border:1px solid var(--line); background:transparent;
            color:var(--fg); font:inherit; font-size:13px; cursor:pointer; }
+  .danger { color:var(--err); border-color:var(--err); }
   .hint { margin:14px 0 0; font-size:12px; color:var(--dim); line-height:1.55; }
   .err { color:var(--err); font-size:13px; min-height:20px; margin:10px 0 0; }
-  .ok { color:#2e9e5b; font-size:13px; min-height:20px; margin:10px 0 0; }
+  .ok { color:var(--ok); font-size:13px; min-height:20px; margin:10px 0 0; }
   .guest-only, .admin-only, .panel { display:none; }
   [data-mode="guest"] .guest-only { display:block; }
   [data-mode="admin"] .admin-only { display:block; }
   .panel[data-open="true"] { display:block; border-top:1px solid var(--line); margin-top:18px; padding-top:16px; }
-  .panel h2 { font-size:14px; margin:0 0 12px; }
+  .acct { display:flex; align-items:center; gap:10px; padding:8px 10px; border:1px solid var(--line);
+          border-radius:8px; margin-bottom:8px; font-size:13px; }
+  .acct .name { flex:1; }
+  .acct .when { color:var(--dim); font-size:12px; }
   code { font-size:12px; padding:1px 5px; border-radius:5px; background:color-mix(in srgb, var(--fg) 8%, transparent); }
 `;
 
@@ -292,6 +400,30 @@ function gatePageHtml() {
 
     <div class="panel" id="panel">
       <h2>管理员设置</h2>
+
+      <div class="row">
+        <label for="mode">门的模式</label>
+        <select id="mode">
+          <option value="admin-only">仅管理员（关闭访客入口）</option>
+          <option value="guest">管理员 + 访客</option>
+          <option value="open">停用闸门（谁都能进）</option>
+        </select>
+        <p class="hint" id="mode-hint" style="margin-top:6px"></p>
+      </div>
+
+      <h2 style="margin-top:18px">管理员账号</h2>
+      <div id="accounts"></div>
+      <div class="row" style="margin-top:10px">
+        <label for="new-name">新账号名</label>
+        <input id="new-name" type="text" placeholder="比如：小号、备用">
+      </div>
+      <div class="row">
+        <label for="new-pass">新账号密码（至少 4 位）</label>
+        <input id="new-pass" type="password" autocomplete="new-password">
+      </div>
+      <div class="row"><button class="ghost" type="button" id="add-account">添加账号</button></div>
+
+      <h2 style="margin-top:18px">改当前账号密码</h2>
       <div class="row">
         <label for="cur">当前密码</label>
         <input id="cur" type="password" autocomplete="current-password">
@@ -302,15 +434,17 @@ function gatePageHtml() {
       </div>
       <div class="row">
         <button class="ghost" type="button" id="save-pw">改密码</button>
-        <button class="ghost" type="button" id="logout">退出闸门</button>
+        <button class="ghost danger" type="button" id="logout">退出闸门</button>
       </div>
-      <p class="ok" id="panel-ok"></p>
+
+      <h2 style="margin-top:18px">访客能拿到什么</h2>
+      <p class="hint" style="margin:0 0 10px">一行一个。接口是 /api 端点名，工具是 agent 能调的工具名。<code>session/*</code> 这种结尾 * 表示整组。</p>
       <div class="row">
-        <label for="eps">访客可用的接口（一行一个）</label>
+        <label for="eps">放行的接口</label>
         <textarea id="eps" spellcheck="false"></textarea>
       </div>
       <div class="row">
-        <label for="tools">访客可用的工具（一行一个）</label>
+        <label for="tools">放行的工具</label>
         <textarea id="tools" spellcheck="false"></textarea>
       </div>
       <div class="row">
@@ -318,6 +452,7 @@ function gatePageHtml() {
         <button class="ghost" type="button" id="reset-policy">恢复默认名单</button>
       </div>
       <p class="hint" id="policy-hint"></p>
+      <p class="ok" id="panel-ok"></p>
     </div>
   </form>
 <script>
@@ -332,13 +467,39 @@ function gatePageHtml() {
   var pw = document.getElementById('pw');
   var go = document.getElementById('go');
   var panel = document.getElementById('panel');
+  var tabGuest = document.getElementById('tab-guest');
+
+  var MODE_TEXT = {
+    'admin-only': '只有管理员能进，访客入口已关闭。',
+    'guest': '管理员输密码；访客免密码进入，只能看不能改。',
+    'open': '闸门已停用，任何人都能直接进入。慎用。'
+  };
 
   function applyMode(next) {
+    if (next === 'guest' && state && !state.guestAllowed) next = 'admin';
     mode = next;
     document.body.dataset.mode = next;
     document.getElementById('tab-admin').setAttribute('aria-selected', next === 'admin' ? 'true' : 'false');
-    document.getElementById('tab-guest').setAttribute('aria-selected', next === 'guest' ? 'true' : 'false');
+    tabGuest.setAttribute('aria-selected', next === 'guest' ? 'true' : 'false');
     err.textContent = '';
+  }
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function renderAccounts(list) {
+    var box = document.getElementById('accounts');
+    if (!list || list.length === 0) { box.innerHTML = '<p class="hint" style="margin:0">还没有账号。</p>'; return; }
+    box.innerHTML = list.map(function (a) {
+      return '<div class="acct"><span class="name">' + esc(a.name) + '</span>' +
+        '<button class="ghost danger" type="button" data-del="' + esc(a.id) + '">删除</button></div>';
+    }).join('');
+    Array.prototype.forEach.call(box.querySelectorAll('[data-del]'), function (btn) {
+      btn.onclick = function () { removeAccount(btn.getAttribute('data-del')); };
+    });
   }
 
   function render() {
@@ -347,7 +508,7 @@ function gatePageHtml() {
     if (!s.configured) {
       sub.textContent = '第一次进来，先给这个门设一个管理员密码。';
       go.textContent = '设置密码并进入';
-      tail.innerHTML = '密码只存在本机（scrypt 加盐哈希）。忘了就删掉 <code>' + s.statePath + '</code> 再打开这里重设。';
+      tail.innerHTML = '密码只存在本机（scrypt 加盐哈希）。忘了就删掉 <code>' + esc(s.statePath) + '</code> 再打开这里重设。';
     } else if (s.entered && s.isAdmin) {
       sub.textContent = '你已经过闸门了。可以回 Harness，或在这里改设置。';
       go.textContent = '回到 Harness';
@@ -356,21 +517,35 @@ function gatePageHtml() {
     } else {
       sub.textContent = '请输入管理员密码进入。';
       go.textContent = '进入';
-      tail.innerHTML = '忘了密码？删掉 <code>' + s.statePath + '</code> 再打开这里重设。';
+      tail.innerHTML = '忘了密码？删掉 <code>' + esc(s.statePath) + '</code> 再打开这里重设。';
       panel.dataset.open = 'false';
     }
-    document.getElementById('guest-hint').textContent =
-      '访客不用密码：能看不能改。当前放行接口 ' + s.guestEndpoints + ' 个、工具 ' + s.guestTools + ' 个。';
+
+    // 访客入口是否可用
+    tabGuest.disabled = !s.guestAllowed;
+    if (!s.guestAllowed && mode === 'guest') applyMode('admin');
+
+    document.getElementById('guest-hint').textContent = s.guestAllowed
+      ? '访客不用密码：能看不能改。当前放行接口 ' + s.guestEndpoints + ' 个、工具 ' + s.guestTools + ' 个。'
+      : '这个门没开访客入口。';
+
     if (s.guest) {
-      document.getElementById('eps').value = s.guest.endpoints.join('\\n');
-      document.getElementById('tools').value = s.guest.tools.join('\\n');
+      document.getElementById('eps').value = (s.guest.endpoints || []).join('\\n');
+      document.getElementById('tools').value = (s.guest.tools || []).join('\\n');
     }
     var policyHint = document.getElementById('policy-hint');
-    if (policyHint) {
+    if (policyHint && s.guest) {
       policyHint.textContent = s.guestCustomized
         ? '当前是自定义名单：插件升级不会再自动补端点。'
         : '当前是默认名单：插件升级会自动补上新端点。';
     }
+
+    var sel = document.getElementById('mode');
+    if (sel && s.mode) sel.value = s.mode;
+    var mh = document.getElementById('mode-hint');
+    if (mh) mh.textContent = MODE_TEXT[s.mode] || '';
+
+    renderAccounts(s.accounts);
   }
 
   function post(path, body) {
@@ -379,9 +554,7 @@ function gatePageHtml() {
       credentials: 'same-origin',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body || {}),
-    }).then(function (r) {
-      return r.json().then(function (json) { return { ok: r.ok, body: json }; });
-    });
+    }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, body: j }; }); });
   }
 
   function loadState() {
@@ -392,7 +565,7 @@ function gatePageHtml() {
   }
 
   document.getElementById('tab-admin').onclick = function () { applyMode('admin'); pw && pw.focus(); };
-  document.getElementById('tab-guest').onclick = function () { applyMode('guest'); };
+  tabGuest.onclick = function () { applyMode('guest'); };
 
   form.onsubmit = function (event) {
     event.preventDefault();
@@ -413,17 +586,51 @@ function gatePageHtml() {
       });
   };
 
+  document.getElementById('mode').onchange = function () {
+    ok.textContent = '';
+    post('mode', { mode: this.value })
+      .then(function (r) {
+        if (!r.ok || !r.body.ok) throw new Error(r.body.error || '改不了');
+        ok.textContent = '模式已更新。';
+        return loadState();
+      })
+      .catch(function (e) { ok.textContent = e.message; });
+  };
+
+  document.getElementById('add-account').onclick = function () {
+    ok.textContent = '';
+    post('account', {
+      name: document.getElementById('new-name').value,
+      password: document.getElementById('new-pass').value,
+    }).then(function (r) {
+      if (!r.ok || !r.body.ok) throw new Error(r.body.error || '加不了');
+      ok.textContent = '账号已添加。';
+      document.getElementById('new-name').value = '';
+      document.getElementById('new-pass').value = '';
+      return loadState();
+    }).catch(function (e) { ok.textContent = e.message; });
+  };
+
+  function removeAccount(id) {
+    if (!confirm('确定删掉这个账号？')) return;
+    ok.textContent = '';
+    post('account/remove', { id: id }).then(function (r) {
+      if (!r.ok || !r.body.ok) throw new Error(r.body.error || '删不了');
+      ok.textContent = '账号已删除。';
+      return loadState();
+    }).catch(function (e) { ok.textContent = e.message; });
+  }
+
   document.getElementById('save-pw').onclick = function () {
     ok.textContent = '';
     post('password', { current: document.getElementById('cur').value, next: document.getElementById('next').value })
-      .then(function (result) {
-        if (!result.ok || !result.body.ok) throw new Error(result.body.error || '改不了');
+      .then(function (r) {
+        if (!r.ok || !r.body.ok) throw new Error(r.body.error || '改不了');
         ok.textContent = '密码已更新。';
         document.getElementById('cur').value = '';
         document.getElementById('next').value = '';
         return loadState();
-      })
-      .catch(function (error) { ok.textContent = error.message; });
+      }).catch(function (e) { ok.textContent = e.message; });
   };
 
   document.getElementById('save-policy').onclick = function () {
@@ -432,22 +639,21 @@ function gatePageHtml() {
       return document.getElementById(id).value.split('\\n').map(function (x) { return x.trim(); }).filter(Boolean);
     };
     post('policy', { endpoints: lines('eps'), tools: lines('tools') })
-      .then(function (result) {
-        if (!result.ok || !result.body.ok) throw new Error(result.body.error || '存不了');
+      .then(function (r) {
+        if (!r.ok || !r.body.ok) throw new Error(r.body.error || '存不了');
         ok.textContent = '访客名单已保存。';
         return loadState();
-      })
-      .catch(function (error) { ok.textContent = error.message; });
+      }).catch(function (e) { ok.textContent = e.message; });
   };
 
   var resetBtn = document.getElementById('reset-policy');
   if (resetBtn) resetBtn.onclick = function () {
     ok.textContent = '';
-    post('policy/reset', {}).then(function (result) {
-      if (!result.ok || !result.body.ok) throw new Error(result.body.error || '恢复不了');
+    post('policy/reset', {}).then(function (r) {
+      if (!r.ok || !r.body.ok) throw new Error(r.body.error || '恢复不了');
       ok.textContent = '已恢复默认名单。';
       return loadState();
-    }).catch(function (error) { ok.textContent = error.message; });
+    }).catch(function (e) { ok.textContent = e.message; });
   };
 
   document.getElementById('logout').onclick = function () {
@@ -467,18 +673,75 @@ function gatePageHtml() {
  * @param {import('@deepseek-ai/cordis').Context} ctx
  */
 export function apply(ctx) {
-  /** token -> { mode, createdAt, lastSeen } */
+  /** token -> { mode, accountId, createdAt, lastSeen } */
   const sessions = new Map();
-  /** 被判定为「访客在用」的 agent id —— ALS 万一断链时的兜底。 */
+  /** 被判定为「访客在用」的 agent id。 */
   const guestAgents = new Set();
   /** 把「这一串异步操作是谁发起的」带进 agent 循环；工具拦截靠它认人。 */
   const als = new AsyncLocalStorage();
-  /** 闸门是否已启用（= 设过密码）。没启用时一切照旧，插件等于不存在。 */
-  let gateEnabled = false;
-  const refreshEnabled = () => loadState()
-    .then((state) => { gateEnabled = state.password !== null; })
-    .catch(() => {});
-  refreshEnabled();
+
+  /**
+   * 状态缓存：每个请求都读盘既慢又会互相打架。
+   * 这里缓存一份，写状态时同步更新；文件被外部改了（比如手删）就靠 mtime 兜底。
+   */
+  let cached = null;
+  let cachedAt = 0;
+  const STATE_TTL_MS = 2000;
+
+  const readState = async (force = false) => {
+    const now = Date.now();
+    if (!force && cached !== null && now - cachedAt < STATE_TTL_MS) return cached;
+    cached = await loadState();
+    cachedAt = now;
+    return cached;
+  };
+  const writeState = async (next) => {
+    await saveState(next);
+    cached = next;
+    cachedAt = Date.now();
+    return next;
+  };
+
+  /** 闸门是否已启用（= 有账号 且 模式不是 open）。 */
+  const gateActive = async () => {
+    const state = await readState();
+    if (state.mode === 'open') return false;
+    return hasAccounts(state);
+  };
+
+  // 启动时先读一遍，让状态就位。
+  readState(true).catch(() => {});
+
+  /** 登录失败计数：`<scope>:<ip>` -> { count, firstAt, lockedUntil } */
+  const failures = new Map();
+  const failureKey = (req) => {
+    const ip = req.socket?.remoteAddress ?? 'unknown';
+    return `login:${ip}`;
+  };
+  const isLockedOut = (req) => {
+    const record = failures.get(failureKey(req));
+    if (record === undefined) return 0;
+    if (record.lockedUntil !== undefined && record.lockedUntil > Date.now()) {
+      return Math.ceil((record.lockedUntil - Date.now()) / 1000);
+    }
+    return 0;
+  };
+  const noteFailure = (req) => {
+    const key = failureKey(req);
+    const now = Date.now();
+    const record = failures.get(key);
+    if (record === undefined || now - record.firstAt > FAILURE_WINDOW_MS) {
+      failures.set(key, { count: 1, firstAt: now });
+      return;
+    }
+    record.count += 1;
+    if (record.count >= MAX_FAILURES) {
+      record.lockedUntil = now + LOCKOUT_MS;
+      record.count = 0;
+      record.firstAt = now;
+    }
+  };
+  const clearFailures = (req) => failures.delete(failureKey(req));
 
   const gateOf = (req) => {
     const token = readCookie(req, COOKIE);
@@ -491,42 +754,46 @@ export function apply(ctx) {
 
   // ---- 1. 挡住没通过闸门的 /api，以及访客越界的端点 -------------------
   //
-  // 先看「这门到底启用没有」：还没设密码 = 闸门没启用，一切照旧放行。
-  // 这一步很重要 —— 插件刚装上、主人还没来得及设密码时，如果直接拦，
-  // 他自己的页面会当场 401 掉线，等于插件把人锁在门外。
+  // 先看「这门到底启用没有」：没账号、或者模式是 open，一切照旧放行。
+  // 插件刚装上、主人还没来得及设密码时如果直接拦，他自己的页面会当场 401
+  // 掉线 —— 等于插件把人锁在门外。
   const guardConnection = async (req, res, next) => {
-    // 命中闸门后走一遍，顺手把这一串异步操作归到谁头上。
-    const proceed = (gate) => (gate === undefined ? next() : als.run(gate, () => next()));
-    const gate = gateOf(req);
-    const path = new URL(req.url ?? '/', 'http://gate.invalid').pathname;
+    try {
+      const state = await readState();
+      const gate = gateOf(req);
+      const path = new URL(req.url ?? '/', 'http://gate.invalid').pathname;
 
-    if (gate === undefined) {
-      const state = await loadState();
-      if (state.password === null) return proceed(undefined);
-      sendJson(res, 401, {
-        ok: false,
-        error: 'gate.locked',
-        message: '还没通过管理员密码。打开 /admin-gate 过闸门再回来。',
-      });
-      return;
-    }
-
-    if (gate.mode === 'guest') {
-      const endpoint = path.replace(/^\/api\//, '');
-      const state = await loadState();
-      if (!guestAllows(state.guest.endpoints, endpoint)) {
-        sendJson(res, 403, {
-          ok: false,
-          error: 'gate.guest-forbidden',
-          message: `访客模式不允许调用 ${endpoint}`,
-        });
-        return;
+      // 闸门没启用：谁都能过
+      if (state.mode === 'open' || !hasAccounts(state)) {
+        return gate === undefined ? next() : als.run(gate, () => next());
       }
-    }
 
-    // 后面可能触发 agent 回合；用 ALS 把「这次是谁发起的」带进去，
-    // 供工具守卫判断该不该放行。
-    return proceed(gate);
+      if (gate === undefined) {
+        return sendJson(res, 401, {
+          ok: false,
+          error: 'gate.locked',
+          message: '还没通过管理员密码。打开 /admin-gate 过闸门再回来。',
+        });
+      }
+
+      if (gate.mode === 'guest') {
+        const endpoint = path.replace(/^\/api\//, '');
+        if (!guestAllows(state.guest.endpoints, endpoint)) {
+          return sendJson(res, 403, {
+            ok: false,
+            error: 'gate.guest-forbidden',
+            message: `访客模式不允许调用 ${endpoint}`,
+          });
+        }
+      }
+
+      return als.run(gate, () => next());
+    } catch (error) {
+      // 闸门自己出问题也不能把整个服务带崩：宁可放行也比 500 好，
+      // 但要留下日志（这里没有 logger，用 console 兜底）。
+      console.warn('[admin-gate] 闸门判断失败，本次放行：%s', error?.message ?? error);
+      return next();
+    }
   };
   ctx.on('connection/request', guardConnection);
 
@@ -545,19 +812,18 @@ export function apply(ctx) {
   });
 
   // ---- 3. 工具名单（真正拦在 dispatch 前） ----------------------------
-  let guestTools = new Set(DEFAULT_GUEST_TOOLS);
-  const refreshTools = () => loadState()
-    .then((state) => { guestTools = new Set(state.guest.tools); })
-    .catch(() => {});
-  refreshTools();
-
+  //
+  // 每次判断都现读名单，不用闭包里的旧 Set —— 主人改完名单要立刻生效，
+  // 而不是等下一次 readState 或重启。
   const toolsService = ctx.get('tools');
   if (toolsService !== undefined) {
     ctx.effect(() => toolsService.guard((execution) => {
       const byRequest = als.getStore()?.mode === 'guest';
       const byAgent = execution.agent !== undefined && guestAgents.has(execution.agent.id);
       if (!byRequest && !byAgent) return undefined;
-      if (guestTools.has(execution.name)) return undefined;
+      // guard 是同步的，不能 await；用缓存里那份（2 秒内）就够。
+      const allowed = cached?.guest?.tools ?? DEFAULT_GUEST_TOOLS;
+      if (allowed.includes(execution.name)) return undefined;
       return `访客模式不允许使用工具 ${execution.name}`;
     }), 'admin-gate: 访客工具白名单');
   }
@@ -568,124 +834,197 @@ export function apply(ctx) {
     const method = req.method ?? 'GET';
 
     if (path === ROUTE || path === `${ROUTE}/`) {
-      if (method !== 'GET' && method !== 'HEAD') { sendJson(res, 405, { ok: false, error: 'method' }); return; }
-      sendHtml(res, 200, gatePageHtml());
-      return;
+      if (method !== 'GET' && method !== 'HEAD') return sendJson(res, 405, { ok: false, error: 'method' });
+      return sendHtml(res, 200, gatePageHtml());
     }
 
-    const state = await loadState();
+    const state = await readState();
     const gate = gateOf(req);
+    const isAdmin = gate?.mode === 'admin';
 
     if (path === `${ROUTE}/api/state`) {
-      sendJson(res, 200, {
+      return sendJson(res, 200, {
         ok: true,
-        configured: state.password !== null,
+        configured: hasAccounts(state),
         entered: gate !== undefined,
         mode: gate?.mode ?? null,
-        isAdmin: gate?.mode === 'admin',
+        isAdmin,
+        gateMode: state.mode,
+        guestAllowed: state.mode === 'guest',
+        accountName: gate?.accountName ?? null,
+        accounts: isAdmin ? accountList(state) : [],
         guestEndpoints: state.guest.endpoints.length,
         guestTools: state.guest.tools.length,
-        guest: gate?.mode === 'admin' ? state.guest : undefined,
+        guest: isAdmin ? state.guest : undefined,
         guestCustomized: state.guest.customized === true,
         statePath: statePath(),
       });
-      return;
     }
 
     if (path === `${ROUTE}/api/setup`) {
-      if (method !== 'POST') { sendJson(res, 405, { ok: false, error: 'method' }); return; }
-      if (state.password !== null) { sendJson(res, 409, { ok: false, error: '已经设过密码了，用登录。' }); return; }
+      if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method' });
+      if (hasAccounts(state)) return sendJson(res, 409, { ok: false, error: '已经设过密码了，用登录。' });
       const body = await readJsonBody(req);
       const password = typeof body.password === 'string' ? body.password : '';
-      if (password.length < 4) { sendJson(res, 400, { ok: false, error: '密码至少 4 位' }); return; }
-      await saveState({ ...state, password: hashPassword(password) });
-      gateEnabled = true;
+      if (password.length < 4) return sendJson(res, 400, { ok: false, error: '密码至少 4 位' });
+      const id = randomBytes(8).toString('hex');
+      const next = {
+        ...state,
+        accounts: { ...state.accounts, [id]: { name: '管理员', ...hashPassword(password), createdAt: Date.now() } },
+      };
+      await writeState(next);
       const token = randomBytes(32).toString('base64url');
-      sessions.set(token, { mode: 'admin', createdAt: Date.now(), lastSeen: Date.now() });
-      sendJson(res, 200, { ok: true, mode: 'admin' }, {
+      sessions.set(token, { mode: 'admin', accountId: id, accountName: '管理员', createdAt: Date.now(), lastSeen: Date.now() });
+      return sendJson(res, 200, { ok: true, mode: 'admin' }, {
         'set-cookie': cookieHeader(token, Math.floor(SESSION_TTL_MS / 1000)),
       });
-      return;
     }
 
     if (path === `${ROUTE}/api/login`) {
-      if (method !== 'POST') { sendJson(res, 405, { ok: false, error: 'method' }); return; }
-      const body = await readJsonBody(req);
-      const mode = body.mode === 'guest' ? 'guest' : 'admin';
-      if (mode === 'admin') {
-        if (state.password === null) { sendJson(res, 409, { ok: false, error: '还没设置密码，请先设置。' }); return; }
-        if (!verifyPassword(typeof body.password === 'string' ? body.password : '', state.password)) {
-          sendJson(res, 401, { ok: false, error: '密码不对。' });
-          return;
-        }
+      if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method' });
+      const lockedFor = isLockedOut(req);
+      if (lockedFor > 0) {
+        return sendJson(res, 429, { ok: false, error: `试错太多次，请等 ${lockedFor} 秒再试。` });
       }
+
+      const body = await readJsonBody(req);
+      const wantMode = body.mode === 'guest' ? 'guest' : 'admin';
+
+      if (wantMode === 'guest') {
+        // 无访客模式 / 停用闸门 都不该走到这里
+        if (state.mode !== 'guest') {
+          return sendJson(res, 403, { ok: false, error: '这个门没开访客入口。' });
+        }
+        const token = randomBytes(32).toString('base64url');
+        sessions.set(token, { mode: 'guest', createdAt: Date.now(), lastSeen: Date.now() });
+        return sendJson(res, 200, { ok: true, mode: 'guest' }, {
+          'set-cookie': cookieHeader(token, Math.floor(SESSION_TTL_MS / 1000)),
+        });
+      }
+
+      if (!hasAccounts(state)) return sendJson(res, 409, { ok: false, error: '还没设置密码，请先设置。' });
+      const password = typeof body.password === 'string' ? body.password : '';
+      const account = matchAccount(state, password);
+      if (account === undefined) {
+        noteFailure(req);
+        return sendJson(res, 401, { ok: false, error: '密码不对。' });
+      }
+      clearFailures(req);
       const token = randomBytes(32).toString('base64url');
-      sessions.set(token, { mode, createdAt: Date.now(), lastSeen: Date.now() });
-      sendJson(res, 200, { ok: true, mode }, {
+      sessions.set(token, {
+        mode: 'admin', accountId: account.id, accountName: account.name,
+        createdAt: Date.now(), lastSeen: Date.now(),
+      });
+      return sendJson(res, 200, { ok: true, mode: 'admin', account: account.name }, {
         'set-cookie': cookieHeader(token, Math.floor(SESSION_TTL_MS / 1000)),
       });
-      return;
     }
 
     if (path === `${ROUTE}/api/logout`) {
       const token = readCookie(req, COOKIE);
       if (token !== undefined) sessions.delete(token);
-      sendJson(res, 200, { ok: true }, {
-        'set-cookie': `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`,
+      return sendJson(res, 200, { ok: true }, { 'set-cookie': clearCookieHeader() });
+    }
+
+    // ---- 以下都是管理员专属 ----
+    if (!isAdmin) {
+      return sendJson(res, 403, {
+        ok: false,
+        error: gate === undefined ? 'gate.locked' : 'gate.admin-only',
+        message: '只有管理员能改这些设置。',
       });
-      return;
+    }
+
+    if (path === `${ROUTE}/api/mode`) {
+      if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method' });
+      const body = await readJsonBody(req);
+      if (!MODES.includes(body.mode)) return sendJson(res, 400, { ok: false, error: '未知模式' });
+      const next = await writeState({ ...state, mode: body.mode });
+      // 关掉访客入口时，把已经在场的访客踢出去，免得他们挂着旧 cookie 继续用。
+      if (body.mode !== 'guest') {
+        for (const [token, entry] of sessions) if (entry.mode === 'guest') sessions.delete(token);
+      }
+      return sendJson(res, 200, { ok: true, mode: next.mode });
+    }
+
+    if (path === `${ROUTE}/api/account`) {
+      if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method' });
+      const body = await readJsonBody(req);
+      const name = typeof body.name === 'string' && body.name.trim() !== '' ? body.name.trim().slice(0, 40) : '管理员';
+      const password = typeof body.password === 'string' ? body.password : '';
+      if (password.length < 4) return sendJson(res, 400, { ok: false, error: '密码至少 4 位' });
+      const id = randomBytes(8).toString('hex');
+      await writeState({
+        ...state,
+        accounts: { ...state.accounts, [id]: { name, ...hashPassword(password), createdAt: Date.now() } },
+      });
+      return sendJson(res, 200, { ok: true, account: { id, name } });
+    }
+
+    if (path === `${ROUTE}/api/account/remove`) {
+      if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method' });
+      const body = await readJsonBody(req);
+      const id = typeof body.id === 'string' ? body.id : '';
+      if (!Object.hasOwn(state.accounts, id)) return sendJson(res, 404, { ok: false, error: '没有这个账号' });
+      if (Object.keys(state.accounts).length <= 1) {
+        return sendJson(res, 400, { ok: false, error: '不能删掉最后一个账号，否则就再也进不来了。' });
+      }
+      const accounts = { ...state.accounts };
+      delete accounts[id];
+      await writeState({ ...state, accounts });
+      // 这个账号签出去的会话一并作废
+      for (const [token, entry] of sessions) if (entry.accountId === id) sessions.delete(token);
+      return sendJson(res, 200, { ok: true });
     }
 
     if (path === `${ROUTE}/api/password`) {
-      if (method !== 'POST') { sendJson(res, 405, { ok: false, error: 'method' }); return; }
-      if (gate?.mode !== 'admin') { sendJson(res, 403, { ok: false, error: '只有管理员能改密码' }); return; }
+      if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method' });
       const body = await readJsonBody(req);
       const current = typeof body.current === 'string' ? body.current : '';
       const next = typeof body.next === 'string' ? body.next : '';
-      if (state.password !== null && !verifyPassword(current, state.password)) {
-        sendJson(res, 401, { ok: false, error: '当前密码不对。' });
-        return;
+      const account = state.accounts[gate.accountId];
+      if (account === undefined) {
+        return sendJson(res, 409, { ok: false, error: '当前账号已不存在，请重新登录。' });
       }
-      if (next.length < 4) { sendJson(res, 400, { ok: false, error: '新密码至少 4 位' }); return; }
-      await saveState({ ...state, password: hashPassword(next) });
-      gateEnabled = true;
+      if (!verifyPassword(current, account)) {
+        noteFailure(req);
+        return sendJson(res, 401, { ok: false, error: '当前密码不对。' });
+      }
+      if (next.length < 4) return sendJson(res, 400, { ok: false, error: '新密码至少 4 位' });
+      await writeState({
+        ...state,
+        accounts: { ...state.accounts, [gate.accountId]: { ...account, ...hashPassword(next) } },
+      });
+      // 改完密码把**别的**会话踢掉：只留当前这个。访客不动——他们本来就免密。
       const mine = readCookie(req, COOKIE);
       for (const [token, entry] of sessions) {
         if (token !== mine && entry.mode === 'admin') sessions.delete(token);
       }
-      sendJson(res, 200, { ok: true });
-      return;
+      return sendJson(res, 200, { ok: true });
     }
 
     if (path === `${ROUTE}/api/policy/reset`) {
-      if (method !== 'POST') { sendJson(res, 405, { ok: false, error: 'method' }); return; }
-      if (gate?.mode !== 'admin') { sendJson(res, 403, { ok: false, error: '只有管理员能改名单' }); return; }
+      if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method' });
       const fresh = emptyState();
-      await saveState({ ...state, guest: fresh.guest });
-      await refreshTools();
-      sendJson(res, 200, { ok: true, guest: fresh.guest });
-      return;
+      await writeState({ ...state, guest: fresh.guest });
+      return sendJson(res, 200, { ok: true, guest: fresh.guest });
     }
 
     if (path === `${ROUTE}/api/policy`) {
-      if (gate?.mode !== 'admin') { sendJson(res, 403, { ok: false, error: '只有管理员能改名单' }); return; }
-      if (method === 'GET') { sendJson(res, 200, { ok: true, guest: state.guest }); return; }
-      if (method !== 'POST') { sendJson(res, 405, { ok: false, error: 'method' }); return; }
+      if (method === 'GET') return sendJson(res, 200, { ok: true, guest: state.guest });
+      if (method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method' });
       const body = await readJsonBody(req);
-      const endpoints = Array.isArray(body.endpoints)
-        ? body.endpoints.filter((x) => typeof x === 'string')
-        : state.guest.endpoints;
-      const tools = Array.isArray(body.tools)
-        ? body.tools.filter((x) => typeof x === 'string')
-        : state.guest.tools;
+      const clean = (list, fallback) => (Array.isArray(list)
+        ? list.filter((x) => typeof x === 'string' && x.trim() !== '').map((x) => x.trim())
+        : fallback);
+      const endpoints = clean(body.endpoints, state.guest.endpoints);
+      const tools = clean(body.tools, state.guest.tools);
       // 主人一保存就算自定义过：以后升级不再自动往名单里补端点。
-      await saveState({ ...state, guest: { endpoints, tools, customized: true } });
-      await refreshTools();
-      sendJson(res, 200, { ok: true, guest: { endpoints, tools, customized: true } });
-      return;
+      await writeState({ ...state, guest: { endpoints, tools, customized: true } });
+      return sendJson(res, 200, { ok: true, guest: { endpoints, tools, customized: true } });
     }
 
-    sendJson(res, 404, { ok: false, error: 'not found' });
+    return sendJson(res, 404, { ok: false, error: 'not found' });
   };
 
   ctx.effect(() => ctx.webServer.register({
@@ -703,54 +1042,67 @@ export function apply(ctx) {
   //
   // 实时流走 HTTP upgrade，不经过 connection/request，上面那层拦不到它。
   //
-  // 第一版这里把访客的 WS 整个拒掉，结果是前端插件连不上事件通道，整页
-  // 报 "Failed to load plugins"。所以现在分两步：
-  //   ① 升级只要求「过了闸门」；
-  //   ② 访客的 socket 挂到**它自己的 Peer** 上，这样每条逻辑流都能认出
-  //      「这是访客在拉」，再按名单筛（见 5b）。
+  // 第一版把访客的 WS 整个拒掉，结果是前端插件连不上事件通道，整页报
+  // "Failed to load plugins"。所以现在：升级只要求「过了闸门」，访客的 socket
+  // 挂到**访客专用 Peer** 上，每条逻辑流再按名单筛（见 5b）。
   //
-  // 为什么非要另给一个 Peer：Connection 的 browserPeer 是所有浏览器共用的
-  // 一个对象，管理员和访客在上面长得一模一样，流这一层分不出谁是谁。
+  // 为什么要另给一个 Peer：Connection 的 browserPeer 是所有浏览器共用同一个
+  // 对象，管理员和访客在上面长得一模一样，流这一层分不出谁是谁。
   const connectionService = ctx.get('connection');
   if (connectionService !== undefined
     && typeof connectionService.admitConnection === 'function'
     && typeof connectionService.createPeer === 'function'
     && connectionService.browserPeer !== undefined) {
     const originalAdmit = connectionService.admitConnection;
-    /** 访客专用 Peer；懒建一次，Connection 卸载时跟着走。 */
-    let guestPeer;
-    const peerForGuest = () => {
-      guestPeer ??= connectionService.createPeer({ principal: { kind: 'owner' }, interactions: 'answer' });
-      return guestPeer;
+
+    /**
+     * 访客专用 Peer。
+     *
+     * 旧实现让所有访客共用一个，等于所有访客挤在同一个会话上：谁断开都可能
+     * 把别人一起带走。这里改成**按 socket 各给一个**，并在 socket 关闭时回收。
+     */
+    const guestPeers = new Map(); // socket -> peer
+    const peerFor = (socket) => {
+      let peer = guestPeers.get(socket);
+      if (peer !== undefined) return peer;
+      peer = connectionService.createPeer({ principal: { kind: 'owner' }, interactions: 'answer' });
+      guestPeers.set(socket, peer);
+      const drop = () => {
+        const owned = guestPeers.get(socket);
+        if (owned === undefined) return;
+        guestPeers.delete(socket);
+        Promise.resolve(owned.dispose()).catch(() => {});
+      };
+      // 升级后的 socket 会在握手完成后继续用；这里挂 close/error 就够。
+      socket?.once?.('close', drop);
+      socket?.once?.('error', drop);
+      return peer;
     };
 
-    const patchedAdmit = function admitConnection(req) {
+    const patchedAdmit = function admitConnection(req, socket) {
       const admission = originalAdmit.call(this, req);
       // 认不过就是认不过，原样把 401/403/409 交回去。
       if (admission?.peer === undefined || admission.peer !== connectionService.browserPeer) return admission;
       const gate = gateOf(req);
+      if (gate !== undefined && gate.mode === 'admin') return admission; // 管理员照旧
+      // 没启用闸门：别把主人自己的实时流掐了。
       if (gate === undefined) {
-        // 还没设密码 = 闸门没启用，别把主人自己的实时流掐了。
-        return gateEnabled ? { rejection: 401 } : admission;
+        return (cached?.mode === 'open' || !hasAccounts(cached ?? emptyState())) ? admission : { rejection: 401 };
       }
-      // 管理员：照旧用共享的 browserPeer，权限和以前一模一样。
-      if (gate.mode !== 'guest') return admission;
-      // 访客：换到访客专用 Peer，后面的流按名单筛。
-      return { peer: peerForGuest(), release: () => Promise.resolve() };
+      // 访客：一人一个 Peer
+      const peer = peerFor(socket);
+      return { peer, release: () => Promise.resolve() };
     };
 
     ctx.effect(() => {
       connectionService.admitConnection = patchedAdmit;
       return async () => {
-        // 只在还是自己那一版时才还原，避免把别人的补丁一起抹掉。
         if (connectionService.admitConnection === patchedAdmit) {
           connectionService.admitConnection = originalAdmit;
         }
-        const owned = guestPeer;
-        guestPeer = undefined;
-        if (owned !== undefined) {
-          try { await owned.dispose(); } catch { /* 已经关了就算了 */ }
-        }
+        const owned = [...guestPeers.values()];
+        guestPeers.clear();
+        await Promise.allSettled(owned.map((peer) => peer.dispose()));
       };
     }, 'admin-gate: WebSocket 升级闸门');
 
@@ -762,8 +1114,8 @@ export function apply(ctx) {
     if (gateway !== undefined && typeof gateway.openWireStream === 'function') {
       const originalOpen = gateway.openWireStream;
       const patchedOpen = async function openWireStream(endpoint, payload, uplink, peer, signal, control, uplinkWindow) {
-        if (guestPeer !== undefined && peer === guestPeer && endpoint !== '$events') {
-          const state = await loadState();
+        if (endpoint !== '$events' && [...guestPeers.values()].includes(peer)) {
+          const state = await readState();
           if (!guestAllows(state.guest.endpoints, endpoint)) {
             throw new Error(`访客模式不允许打开 ${endpoint}`);
           }
@@ -787,21 +1139,31 @@ export function apply(ctx) {
     table.push({
       kind: 'script',
       placement: 'head',
-      text: `(function(){try{fetch('${ROUTE}/api/state',{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(s){if(!s.entered)location.replace('${ROUTE}')}).catch(function(){location.replace('${ROUTE}')})}catch(e){location.replace('${ROUTE}')}})();`,
+      text: `(function(){try{fetch('${ROUTE}/api/state',{credentials:'same-origin'}).then(function(r){return r.json()}).then(function(s){if(s.gateMode==='open')return;if(!s.entered)location.replace('${ROUTE}')}).catch(function(){})}catch(e){}})();`,
     });
   });
 
   ctx.effect(() => () => {
     sessions.clear();
     guestAgents.clear();
+    failures.clear();
   }, 'admin-gate: 会话清理');
 
-  // 定期清掉过期会话，避免 token 表只增不减。
+  // 定期清掉过期会话与失败记录，避免两张表只增不减。
   const timer = setInterval(() => {
     const now = Date.now();
     for (const [token, entry] of sessions) {
       if (now - entry.lastSeen > SESSION_TTL_MS) sessions.delete(token);
     }
-  }, 60 * 60 * 1000);
-  ctx.effect(() => () => clearInterval(timer), 'admin-gate: 会话过期清理');
+    for (const [key, record] of failures) {
+      const expired = now - record.firstAt > FAILURE_WINDOW_MS
+        && (record.lockedUntil === undefined || record.lockedUntil < now);
+      if (expired) failures.delete(key);
+    }
+  }, 10 * 60 * 1000);
+  if (typeof timer.unref === 'function') timer.unref();
+  ctx.effect(() => () => clearInterval(timer), 'admin-gate: 过期清理');
 }
+
+// 给单元测试用（生产代码不依赖这些导出）。
+export { guestAllows, migrate, emptyState, hasAccounts };
