@@ -43,6 +43,25 @@ window.__ModuleLoader__.load({
       policySaved: '访客名单已保存。',
       adminOnly: '只有管理员能改。',
       unreachable: '读不到闸门状态。',
+      modeTitle: '门的模式',
+      modeAdminOnly: '仅管理员（关闭访客入口）',
+      modeGuest: '管理员 + 访客',
+      modeOpen: '停用闸门（谁都能进）',
+      modeHintAdminOnly: '只有管理员能进，访客入口已关闭。',
+      modeHintGuest: '管理员输密码；访客免密码进入，只能看不能改。',
+      modeHintOpen: '闸门已停用，任何人都能直接进入。慎用。',
+      accountsTitle: '管理员账号',
+      noAccounts: '还没有账号。',
+      newName: '新账号名',
+      newPass: '新账号密码（至少 4 位）',
+      addAccount: '添加账号',
+      del: '删除',
+      accountAdded: '账号已添加。',
+      accountRemoved: '账号已删除。',
+      confirmDel: '确定删掉这个账号？',
+      lastAccount: '不能删掉最后一个账号。',
+      modeSaved: '模式已更新。',
+      wildcardHint: '支持 session/* 这种结尾 * 的写法表示整组。',
     };
     const en = {
       nav: 'Admin Password',
@@ -71,6 +90,25 @@ window.__ModuleLoader__.load({
       policySaved: 'Guest allowlist saved.',
       adminOnly: 'Admins only.',
       unreachable: 'Cannot read the gate state.',
+      modeTitle: 'Gate mode',
+      modeAdminOnly: 'Admins only (guest entry closed)',
+      modeGuest: 'Admins + guests',
+      modeOpen: 'Gate disabled (anyone may enter)',
+      modeHintAdminOnly: 'Only admins may enter; guest entry is closed.',
+      modeHintGuest: 'Admins sign in with a password; guests enter without one and can only look.',
+      modeHintOpen: 'The gate is disabled. Anyone can enter. Use with care.',
+      accountsTitle: 'Admin accounts',
+      noAccounts: 'No accounts yet.',
+      newName: 'New account name',
+      newPass: 'New account password (4+ characters)',
+      addAccount: 'Add account',
+      del: 'Delete',
+      accountAdded: 'Account added.',
+      accountRemoved: 'Account removed.',
+      confirmDel: 'Delete this account?',
+      lastAccount: 'The last account cannot be deleted.',
+      modeSaved: 'Mode updated.',
+      wildcardHint: 'A trailing * such as session/* matches the whole group.',
     };
 
     const S = {
@@ -178,6 +216,10 @@ window.__ModuleLoader__.load({
         const [endpoints, setEndpoints] = React.useState('');
         const [tools, setTools] = React.useState('');
         const [message, setMessage] = React.useState(null);
+        const [gateMode, setGateMode] = React.useState('admin-only');
+        const [accounts, setAccounts] = React.useState([]);
+        const [newName, setNewName] = React.useState('');
+        const [newPass, setNewPass] = React.useState('');
 
         const reload = React.useCallback(() => {
           request('state')
@@ -185,6 +227,8 @@ window.__ModuleLoader__.load({
               setState(body);
               if (Array.isArray(body.guest?.endpoints)) setEndpoints(body.guest.endpoints.join('\n'));
               if (Array.isArray(body.guest?.tools)) setTools(body.guest.tools.join('\n'));
+              if (typeof body.gateMode === 'string') setGateMode(body.gateMode);
+              if (Array.isArray(body.accounts)) setAccounts(body.accounts);
             })
             .catch(() => setState({ entered: false, failed: true }));
         }, []);
@@ -228,6 +272,51 @@ window.__ModuleLoader__.load({
                 return;
               }
               setMessage({ tone: 'ok', text: t('policySaved') });
+              reload();
+            })
+            .catch((error) => setMessage({ tone: 'error', text: String(error) }));
+        };
+
+        const changeMode = (next) => {
+          setMessage(null);
+          request('mode', { method: 'POST', body: JSON.stringify({ mode: next }) })
+            .then(({ ok, body }) => {
+              if (!ok) {
+                setMessage({ tone: 'error', text: body.error || t('adminOnly') });
+                return;
+              }
+              setMessage({ tone: 'ok', text: t('modeSaved') });
+              reload();
+            })
+            .catch((error) => setMessage({ tone: 'error', text: String(error) }));
+        };
+
+        const addAccount = () => {
+          setMessage(null);
+          request('account', { method: 'POST', body: JSON.stringify({ name: newName, password: newPass }) })
+            .then(({ ok, body }) => {
+              if (!ok) {
+                setMessage({ tone: 'error', text: body.error || t('adminOnly') });
+                return;
+              }
+              setMessage({ tone: 'ok', text: t('accountAdded') });
+              setNewName('');
+              setNewPass('');
+              reload();
+            })
+            .catch((error) => setMessage({ tone: 'error', text: String(error) }));
+        };
+
+        const removeAccount = (id) => {
+          if (typeof window !== 'undefined' && !window.confirm(t('confirmDel'))) return;
+          setMessage(null);
+          request('account/remove', { method: 'POST', body: JSON.stringify({ id }) })
+            .then(({ ok, body }) => {
+              if (!ok) {
+                setMessage({ tone: 'error', text: body.error || t('lastAccount') });
+                return;
+              }
+              setMessage({ tone: 'ok', text: t('accountRemoved') });
               reload();
             })
             .catch((error) => setMessage({ tone: 'error', text: String(error) }));
@@ -295,6 +384,62 @@ window.__ModuleLoader__.load({
               button(t('savePassword'), savePassword, true),
               h('button', { type: 'button', style: S.button, onClick: logout }, t('logout')),
             ),
+          ),
+          h('div', { style: S.card },
+            h('h3', { style: S.heading }, t('modeTitle')),
+            h('div', null,
+              h('select', {
+                style: { ...S.input, cursor: 'pointer' },
+                value: gateMode,
+                disabled,
+                onChange: (event) => changeMode(event.target.value),
+              },
+                h('option', { value: 'admin-only' }, t('modeAdminOnly')),
+                h('option', { value: 'guest' }, t('modeGuest')),
+                h('option', { value: 'open' }, t('modeOpen')),
+              ),
+              h('p', { style: S.muted },
+                gateMode === 'admin-only' ? t('modeHintAdminOnly')
+                  : gateMode === 'guest' ? t('modeHintGuest')
+                    : t('modeHintOpen')),
+            ),
+          ),
+          h('div', { style: S.card },
+            h('h3', { style: S.heading }, t('accountsTitle')),
+            accounts.length === 0
+              ? h('p', { style: S.muted }, t('noAccounts'))
+              : h('div', null, accounts.map((a) => h('div', {
+                key: a.id,
+                style: {
+                  display: 'flex', alignItems: 'center', gap: 10,
+                  padding: '8px 10px', border: '1px solid var(--dsw-alias-border-l1)',
+                  borderRadius: 8, marginBottom: 8, fontSize: 13,
+                },
+              },
+                h('span', { style: { flex: 1, color: 'var(--dsw-alias-label-primary)' } }, a.name),
+                h('button', {
+                  type: 'button',
+                  style: { ...S.button, color: 'var(--dsw-alias-state-error-primary)', ...(disabled ? S.disabled : {}) },
+                  disabled,
+                  onClick: () => removeAccount(a.id),
+                }, t('del')),
+              ))),
+            h('div', { style: { marginTop: 10 } },
+              h('label', { style: S.label, htmlFor: 'ag-new-name' }, t('newName')),
+              h('input', {
+                id: 'ag-new-name', style: S.input, value: newName, disabled,
+                onChange: (event) => setNewName(event.target.value),
+              }),
+            ),
+            h('div', { style: { marginTop: 10 } },
+              h('label', { style: S.label, htmlFor: 'ag-new-pass' }, t('newPass')),
+              h('input', {
+                id: 'ag-new-pass', type: 'password', style: S.input, value: newPass, disabled,
+                onChange: (event) => setNewPass(event.target.value),
+              }),
+            ),
+            h('div', { style: { ...S.row, marginTop: 10 } },
+              button(t('addAccount'), addAccount, true)),
           ),
           h('div', { style: S.card },
             h('h3', { style: S.heading }, t('guestTitle')),
