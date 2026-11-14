@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-admin-gate",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
   "type": "module",
   "description": "进入 Harness 前先过一道门：管理员密码 or 访客身份；访客按名单放行 API 与工具。",
@@ -19,11 +19,15 @@
     "README.md"
   ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "immediately": true,
-      "inject": ["@deepseek-ai/dsh-client-ui-conversation"]
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
     }
   }
 }
