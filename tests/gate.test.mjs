@@ -145,14 +145,45 @@ t('访客越界端点 403', r.status === 403, r.status);
 
 // ---------- 状态文件 ----------
 const raw = JSON.parse(await readFile(join(process.env.DSH_HOME, 'admin-gate.json'), 'utf8'));
-t('状态是 v2 且有多账号', raw.version === 2 && Object.keys(raw.accounts).length >= 1);
+t('状态是 v3 且有多账号', raw.version === 3 && Object.keys(raw.accounts).length >= 1);
 t('不存明文密码', !JSON.stringify(raw).includes('pass1234'));
 t('有 mode 字段', typeof raw.mode === 'string', raw.mode);
 
 // ---------- v1 → v2 迁移 ----------
 const mig = mod.migrate({ version: 1, password: { salt: 'x', hash: 'y', n:1,r:1,p:1 } });
 t('v1 迁移出账号', Object.keys(mig.accounts).length === 1);
-t('迁移后版本是 2', mig.version === 2);
+t('迁移后版本是 3', mig.version === 3);
+
+
+// ---------- 会话归属（纯函数层） ----------
+const { identityKey: ik, ownsSession: owns, sessionIdOf: sidOf } = mod;
+const whoA = { kind: 'admin', accountId: 'a' };
+const whoB = { kind: 'admin', accountId: 'b' };
+const whoG = { kind: 'guest' };
+const st = { sessions: { s1: 'acct:a', s2: 'guest' } };
+
+t('身份键: 管理员', ik(whoA) === 'acct:a');
+t('身份键: 访客', ik(whoG) === 'guest');
+t('甲的对话甲能看', owns(st, whoA, 's1') === true);
+t('甲的对话乙看不到', owns(st, whoB, 's1') === false);
+t('甲的对话访客看不到', owns(st, whoG, 's1') === false);
+t('访客的对话访客能看', owns(st, whoG, 's2') === true);
+t('访客的对话管理员看不到', owns(st, whoA, 's2') === false);
+t('无主的老对话管理员能看', owns(st, whoA, 'sX') === true);
+t('无主的老对话访客看不到', owns(st, whoG, 'sX') === false);
+
+t('取 sessionId: sessionId 字段', sidOf({ sessionId: 'x' }) === 'x');
+t('取 sessionId: address.kind=session', sidOf({ address: { kind: 'session', sessionId: 'y' } }) === 'y');
+t('取 sessionId: address.kind=subagent', sidOf({ address: { kind: 'subagent', childSessionId: 'z' } }) === 'z');
+t('取 sessionId: 空参数', sidOf({}) === undefined);
+t('取 sessionId: null 不崩', sidOf(null) === undefined);
+
+// ---------- 多账号对话独立 ----------
+const ownedState = { sessions: { sAdmin: 'acct:a', sOther: 'acct:b' } };
+t('同号能看到自己的两段', owns(ownedState, whoA, 'sAdmin') && !owns(ownedState, whoA, 'sOther'));
+
+// ---------- 状态里 sessions 表 ----------
+t('状态有 sessions 表', typeof raw.sessions === 'object' && raw.sessions !== null);
 
 server.close();
 for (const [s, l, e] of R) console.log(`${s}  ${l}${e ? '  [' + e + ']' : ''}`);
