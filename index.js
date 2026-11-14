@@ -29,8 +29,16 @@ export const name = 'admin-gate';
 export const inject = ['webServer'];
 
 const COOKIE = 'dsh-admin-gate';
+
+/**
+ * 挂在 Peer 上的「这人是哪个身份」标记。
+ *
+ * 用 Symbol 而不是 principal 字段：principal 的形状是 Harness 的契约，往里塞
+ * 自定义键迟早被 schema 校验打回来；而 Peer 只是我们放进连接里的一层壳。
+ */
+const GATE_IDENTITY = Symbol.for('dsh.adminGate.identity');
 const ROUTE = '/admin-gate';
-const STATE_VERSION = 2;
+const STATE_VERSION = 3;
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const SCRYPT = { n: 16384, r: 8, p: 1, len: 64 };
 
@@ -104,6 +112,40 @@ function guestAllows(endpoints, endpoint) {
   return false;
 }
 
+// ------------------------------------------------- 身份与归属（纯函数）
+//
+// 「这段对话是谁的」——访客看不得管理员的，管理员甲也看不得管理员乙的。
+//
+// 状态里一张 `sessions: { sessionId -> 身份键 }` 记着归属，身份键形如
+// `acct:<账号id>` 或 `guest`。没登记的老会话算无主：只有管理员看得见。
+
+/** Peer -> { kind: 'admin'|'guest', accountId?, accountName? } */
+const peerIdentity = new WeakMap();
+
+/** 一个身份的身份键。 */
+function identityKey(who) {
+  return who.kind === 'guest' ? 'guest' : `acct:${who.accountId ?? 'unknown'}`;
+}
+
+/** 从一次调用的参数里把 sessionId 抠出来（会话方法的参数只有两种形状）。 */
+function sessionIdOf(request) {
+  if (request === null || typeof request !== 'object') return undefined;
+  if (typeof request.sessionId === 'string') return request.sessionId;
+  const address = request.address;
+  if (address !== null && typeof address === 'object') {
+    if (typeof address.sessionId === 'string') return address.sessionId;
+    if (typeof address.childSessionId === 'string') return address.childSessionId;
+  }
+  return undefined;
+}
+
+/** 这段对话归 `who` 吗。没登记的算无主：只有管理员看得见。 */
+function ownsSession(state, who, sessionId) {
+  const owner = state?.sessions?.[sessionId];
+  if (owner === undefined) return who.kind === 'admin';
+  return owner === identityKey(who);
+}
+
 // ------------------------------------------------------------------ 存储
 
 function statePath() {
@@ -117,6 +159,8 @@ function emptyState() {
     version: STATE_VERSION,
     mode: 'admin-only',
     accounts: {},
+    // 会话归属：sessionId -> 身份键（acct:<账号id>）。闸门在里面判「这段对话是谁的」。
+    sessions: {},
     guest: {
       endpoints: [...DEFAULT_GUEST_ENDPOINTS],
       tools: [...DEFAULT_GUEST_TOOLS],
@@ -153,6 +197,14 @@ function migrate(parsed) {
     accounts = parsed.accounts;
   }
 
+  // v2 → v3 只是多了一张会话归属表；没有就空着，老会话按「主账号」兜底认领。
+  let sessions = {};
+  if (parsed?.sessions && typeof parsed.sessions === 'object' && !Array.isArray(parsed.sessions)) {
+    for (const [id, owner] of Object.entries(parsed.sessions)) {
+      if (typeof id === 'string' && id !== '' && typeof owner === 'string' && owner !== '') sessions[id] = owner;
+    }
+  }
+
   const mode = MODES.includes(parsed?.mode) ? parsed.mode : 'admin-only';
   const customized = parsed?.guest?.customized === true;
 
@@ -160,6 +212,7 @@ function migrate(parsed) {
     version: STATE_VERSION,
     mode,
     accounts,
+    sessions,
     guest: {
       endpoints: customized && Array.isArray(parsed?.guest?.endpoints)
         ? parsed.guest.endpoints
@@ -1038,87 +1091,201 @@ export function apply(ctx) {
     },
   }), 'admin-gate: 闸门路由');
 
-  // ---- 5. WebSocket 也要过闸门 ----------------------------------------
+  /**
+   * 升级到 v3 之后的一次性归属迁移。
+   *
+   * 老状态里根本没有归属表，可磁盘上有一堆真对话。全丢给访客不行、全拒也不行，
+   * 按实际情况划给**最早创建的那个账号** —— 那些对话本来就是它开的。
+   */
+  const ensureSessionOwners = async () => {
+    const state = await readState(true);
+    if (state.sessionsMigrated === true) return;
+    const sessionQuery = ctx.get('sessionQuery');
+    const first = Object.entries(state.accounts ?? {})
+      .sort((a, b) => (Number(a[1]?.createdAt) || 0) - (Number(b[1]?.createdAt) || 0))[0];
+    if (first === undefined) return;
+    let records = [];
+    if (sessionQuery !== undefined && typeof sessionQuery.listSessions === 'function') {
+      try {
+        records = await sessionQuery.listSessions();
+      } catch {
+        return; // 读不出来就下次再说，别把迁移标记写死。
+      }
+    }
+    const sessionsOwned = { ...(state.sessions ?? {}) };
+    const owner = `acct:${first[0]}`;
+    let added = 0;
+    for (const record of records) {
+      const id = record?.header?.id;
+      if (typeof id !== 'string' || id === '') continue;
+      if (sessionsOwned[id] !== undefined) continue;
+      sessionsOwned[id] = owner;
+      added += 1;
+    }
+    await writeState({ ...state, sessions: sessionsOwned, sessionsMigrated: true });
+    if (added > 0) {
+      console.log('[admin-gate] 已把 %d 段老对话划给账号「%s」', added, first[1]?.name ?? first[0]);
+    }
+  };
+
+  // 状态就位之后把老对话的归属补上（一次性）。
+  Promise.resolve().then(ensureSessionOwners).catch(() => {});
+
+  // ---- 5. 身份：闸门自己说了算 ----------------------------------------
   //
-  // 实时流走 HTTP upgrade，不经过 connection/request，上面那层拦不到它。
+  // 这一节是整个插件的地基，先说清楚为什么要动 Harness 的 connection。
   //
-  // 第一版把访客的 WS 整个拒掉，结果是前端插件连不上事件通道，整页报
-  // "Failed to load plugins"。所以现在：升级只要求「过了闸门」，访客的 socket
-  // 挂到**访客专用 Peer** 上，每条逻辑流再按名单筛（见 5b）。
+  // 【问题】Harness 的 /api 和 /（主界面 HTML）在进到我们这一层之前，就已经被
+  // Connection 自己的 browserAuth 拦住过一次了：没有它签发的 cookie 一律 401。
+  // 也就是说，**访客根本进不来** —— 他既没有管理员密码，也没有那个 cookie。
+  // v1.1 里访客能"进去"，其实只是借了同一个浏览器里管理员已经登录的 cookie，
+  // 用的还是 owner 身份。所以"访客能看管理员对话"根本不是名单漏了某个端点，
+  // 而是访客压根没有自己的身份。
   //
-  // 为什么要另给一个 Peer：Connection 的 browserPeer 是所有浏览器共用同一个
-  // 对象，管理员和访客在上面长得一模一样，流这一层分不出谁是谁。
+  // 【做法】把 admit / admitConnection / authorizeIndex 三个鉴权入口包一层：
+  //   · 闸门没启用（没账号 / mode=open）→ 原样交给 Harness，主人不会被锁在门外；
+  //   · 过了闸门                      → 发一个带身份标记的 Peer，不再问 Harness 要 cookie；
+  //   · 没过闸门                      → 401 / 303 到闸门页。
+  // 唯一保留的是 Harness 自己的 Host 信任检查（403）：那是防 DNS rebinding 的，
+  // 跟登录状态无关，不该被我们绕过去。
+  //
+  // 身份用 Symbol 挂在 Peer 上（而不是塞进 principal）：principal 的形状是
+  // Harness 的契约，多塞一个键迟早被它的 schema 校验打回来。
+
+  /** 从 Peer 上读身份；读不到就是主人自己（Harness 原有行为）。 */
+  const identityOfPeer = (peer) => (peer === undefined ? undefined : peerIdentity.get(peer));
+
   const connectionService = ctx.get('connection');
   if (connectionService !== undefined
-    && typeof connectionService.admitConnection === 'function'
-    && typeof connectionService.createPeer === 'function'
-    && connectionService.browserPeer !== undefined) {
-    const originalAdmit = connectionService.admitConnection;
+    && typeof connectionService.admit === 'function'
+    && typeof connectionService.createPeer === 'function') {
+    const originalAdmit = connectionService.admit;
+    const originalAdmitConnection = connectionService.admitConnection;
+    const originalAuthorizeIndex = connectionService.authorizeIndex;
 
     /**
-     * 访客专用 Peer。
+     * 身份 -> Peer 的缓存。
      *
-     * 旧实现让所有访客共用一个，等于所有访客挤在同一个会话上：谁断开都可能
-     * 把别人一起带走。这里改成**按 socket 各给一个**，并在 socket 关闭时回收。
+     * 每个请求都新建一个 Peer 会随手挂一堆活对象在进程里，所以按身份复用：
+     * 一个管理员账号一个、访客共一个。登出 / 删账号 / 改模式时把对应的收掉。
      */
-    const guestPeers = new Map(); // socket -> peer
-    const peerFor = (socket) => {
-      let peer = guestPeers.get(socket);
-      if (peer !== undefined) return peer;
-      peer = connectionService.createPeer({ principal: { kind: 'owner' }, interactions: 'answer' });
-      guestPeers.set(socket, peer);
-      const drop = () => {
-        const owned = guestPeers.get(socket);
-        if (owned === undefined) return;
-        guestPeers.delete(socket);
-        Promise.resolve(owned.dispose()).catch(() => {});
-      };
-      // 升级后的 socket 会在握手完成后继续用；这里挂 close/error 就够。
-      socket?.once?.('close', drop);
-      socket?.once?.('error', drop);
+    const peers = new Map(); // 身份键 -> peer
+
+    const peerFor = (who) => {
+      const key = identityKey(who);
+      const cachedPeer = peers.get(key);
+      if (cachedPeer !== undefined && !cachedPeer.signal?.aborted) return cachedPeer;
+      const peer = connectionService.createPeer({ principal: { kind: 'owner' }, interactions: 'answer' });
+      peerIdentity.set(peer, who);
+      peers.set(key, peer);
       return peer;
     };
 
-    const patchedAdmit = function admitConnection(req, socket) {
+    const dropPeer = (key) => {
+      const peer = peers.get(key);
+      if (peer === undefined) return;
+      peers.delete(key);
+      Promise.resolve(peer.dispose()).catch(() => {});
+    };
+
+    const gateIsOn = () => cached !== null && cached !== undefined && cached.mode !== 'open' && hasAccounts(cached);
+
+    /**
+     * 闸门会话条目 -> 身份。
+     *
+     * 条目的字段是 `mode`（admin / guest），身份要的是 `kind` —— 两套词不能混用，
+     * 混用的下场就是访客被当成"没有账号的管理员"，而这正是要杜绝的那种混淆。
+     */
+    const identityOfGate = (gate) => (gate.mode === 'guest'
+      ? { kind: 'guest' }
+      : { kind: 'admin', accountId: gate.accountId, accountName: gate.accountName });
+
+    const patchedAdmit = function admit(req) {
+      if (!gateIsOn()) return originalAdmit.call(this, req);
+      // 先让 Harness 跑一次：我们要它的 Host 信任检查（403），只是不要它的 cookie 判断（401）。
       const admission = originalAdmit.call(this, req);
-      // 认不过就是认不过，原样把 401/403/409 交回去。
-      if (admission?.peer === undefined || admission.peer !== connectionService.browserPeer) return admission;
-      const gate = gateOf(req);
-      if (gate !== undefined && gate.mode === 'admin') return admission; // 管理员照旧
-      // 没启用闸门：别把主人自己的实时流掐了。
-      if (gate === undefined) {
-        return (cached?.mode === 'open' || !hasAccounts(cached ?? emptyState())) ? admission : { rejection: 401 };
+      if (admission !== undefined && admission !== null && 'rejection' in admission && admission.rejection !== 401) {
+        return admission;
       }
-      // 访客：一人一个 Peer
-      const peer = peerFor(socket);
-      return { peer, release: () => Promise.resolve() };
+      const gate = gateOf(req);
+      if (gate === undefined) return { rejection: 401 };
+      return { peer: peerFor(identityOfGate(gate)), release: () => Promise.resolve() };
+    };
+
+    const patchedAdmitConnection = function admitConnection(req, socket) {
+      if (!gateIsOn()) return originalAdmitConnection.call(this, req, socket);
+      const probe = originalAdmitConnection.call(this, req, socket);
+      if (probe !== undefined && probe !== null && 'rejection' in probe && probe.rejection !== 401) return probe;
+      // probe 可能已经占了一个 operator socket；交还回去再换自己的。
+      if (probe !== undefined && probe !== null && typeof probe.release === 'function') {
+        Promise.resolve(probe.release()).catch(() => {});
+      }
+      const gate = gateOf(req);
+      if (gate === undefined) return { rejection: 401 };
+      return { peer: peerFor(identityOfGate(gate)), release: () => Promise.resolve() };
+    };
+
+    /**
+     * 主界面 HTML 的鉴权。
+     *
+     * Harness 在这里要求它自己签发的 cookie —— 访客没有，于是整页 401，连
+     * "看"都做不到。闸门启用时改成认我们的 cookie：进了闸门就能看界面。
+     * 这是安全的，因为页面上一切数据都要走 /api，而 /api 由下面的端点层
+     * 按身份筛。
+     */
+    const patchedAuthorizeIndex = function authorizeIndex(req, res) {
+      if (!gateIsOn()) return originalAuthorizeIndex.call(this, req, res);
+      // 顺序很重要：originalAuthorizeIndex 一旦不认，它会**当场**写出 401，
+      // 之后再想 303 就晚了（headers 已经发出）。所以过了闸门的先放行。
+      if (gateOf(req) !== undefined) return true;
+      // 没过闸门：先让 Harness 处理 launch token 换 cookie（它会 303 抹掉地址里
+      // 的 token）；它不认就直接去闸门页，别再让它写那个 401。
+      const url = new URL(req.url ?? '/', 'http://gate.invalid');
+      if (url.searchParams.has('token')) return originalAuthorizeIndex.call(this, req, res);
+      if (res.headersSent) return false;
+      res.writeHead(303, { 'cache-control': 'no-store', location: ROUTE, 'referrer-policy': 'no-referrer' });
+      res.end();
+      return false;
     };
 
     ctx.effect(() => {
-      connectionService.admitConnection = patchedAdmit;
+      connectionService.admit = patchedAdmit;
+      connectionService.admitConnection = patchedAdmitConnection;
+      connectionService.authorizeIndex = patchedAuthorizeIndex;
       return async () => {
-        if (connectionService.admitConnection === patchedAdmit) {
-          connectionService.admitConnection = originalAdmit;
-        }
-        const owned = [...guestPeers.values()];
-        guestPeers.clear();
+        if (connectionService.admit === patchedAdmit) connectionService.admit = originalAdmit;
+        if (connectionService.admitConnection === patchedAdmitConnection) connectionService.admitConnection = originalAdmitConnection;
+        if (connectionService.authorizeIndex === patchedAuthorizeIndex) connectionService.authorizeIndex = originalAuthorizeIndex;
+        const owned = [...peers.values()];
+        peers.clear();
         await Promise.allSettled(owned.map((peer) => peer.dispose()));
       };
-    }, 'admin-gate: WebSocket 升级闸门');
+    }, 'admin-gate: 身份闸门');
+
+    // 登出 / 账号被删 / 关掉访客入口时，把对应的 Peer 收掉，别让旧身份挂在内存里。
+    ctx.effect(() => () => {
+      for (const key of [...peers.keys()]) dropPeer(key);
+    }, 'admin-gate: 身份回收');
 
     // ---- 5b. 访客的流按名单筛 -----------------------------------------
     //
-    // 只有访客 Peer 上的流要过名单；管理员和 /connect 出来的 API operator
-    // 一概照旧。`$events` 是前端刷新用的事件通道，不是业务端点，放行。
+    // 管理员和 /connect 出来的 API operator 一概照旧。`$events` 是前端刷新
+    // 用的事件通道，不是业务端点，放行。
     const gateway = ctx.get('typertGateway');
     if (gateway !== undefined && typeof gateway.openWireStream === 'function') {
       const originalOpen = gateway.openWireStream;
       const patchedOpen = async function openWireStream(endpoint, payload, uplink, peer, signal, control, uplinkWindow) {
-        if (endpoint !== '$events' && [...guestPeers.values()].includes(peer)) {
-          const state = await readState();
-          if (!guestAllows(state.guest.endpoints, endpoint)) {
-            throw new Error(`访客模式不允许打开 ${endpoint}`);
+        const who = identityOfPeer(peer);
+        if (who !== undefined && endpoint !== '$events') {
+          if (who.kind === 'guest') {
+            const state = await readState();
+            if (!guestAllows(state.guest.endpoints, endpoint)) {
+              throw new Error(`访客模式不允许打开 ${endpoint}`);
+            }
           }
+          // 归属：不是自己的对话，流也不许开。
+          const denied = await ownerVerdict(who, endpoint, payload);
+          if (denied !== undefined) throw denied;
         }
         return originalOpen.call(this, endpoint, payload, uplink, peer, signal, control, uplinkWindow);
       };
@@ -1128,6 +1295,121 @@ export function apply(ctx) {
           if (gateway.openWireStream === patchedOpen) gateway.openWireStream = originalOpen;
         };
       }, 'admin-gate: 访客流白名单');
+    }
+
+    /** 一次可能越界的会话调用该怎么处理；放行时返回 undefined。 */
+    const ownershipGuard = (who, name, args) => {
+      const request = args[0];
+      const sessionId = sessionIdOf(request);
+      // 拿不到 sessionId 的方法（modelCatalog / canOpenWorkspacePath 之类）不归这里管。
+      if (sessionId === undefined) return undefined;
+      const state = cached;
+      if (state === null) return undefined;
+      if (ownsSession(state, who, sessionId)) return undefined;
+      if (who.kind === 'guest') return new Error('访客看不到管理员的对话。');
+      return new Error(`这段对话不属于当前账号（${who.accountName ?? who.accountId ?? '未知'}）。`);
+    };
+
+    /** 流的归属判断：直接按端点 + payload 判，判不过就抛。 */
+    const ownerVerdict = async (who, endpoint, payload) => {
+      const args = payload?.args ?? {};
+      const state = await readState();
+      const sessionId = sessionIdOf(args.request) ?? sessionIdOf(args);
+      if (sessionId === undefined || ownsSession(state, who, sessionId)) return undefined;
+      return new Error(`这段对话不属于当前身份，${endpoint} 被拒绝。`);
+    };
+
+    /** 认领一段对话：谁开的就记谁名下。 */
+    const claimSession = async (sessionId, who) => {
+      if (sessionId === undefined) return;
+      const state = await readState(true);
+      if (state.sessions?.[sessionId] !== undefined) return;
+      await writeState({ ...state, sessions: { ...(state.sessions ?? {}), [sessionId]: identityKey(who) } });
+    };
+
+    // ---- 5c. 对话归属：谁的对话，谁才看得见 ----------------------------
+    //
+    // 光拦 HTTP 不够。会话类方法有二十来个，漏一个就是一条越权路径，所以这里
+    // 直接包 sessionController 这个服务对象：所有会话方法进同一个闸，按方法
+    // 参数里带的 sessionId 判断归属。
+    //
+    // 为什么不去改 typert 的 resource 声明：那是生成代码里的东西，改完下次
+    // Harness 升级就被盖掉了；而服务对象是我们进程里的活对象。
+    const sessionController = ctx.get('sessionController');
+    if (sessionController !== undefined) {
+      const filtered = ['list', 'search'];
+      const owned = [
+        'page', 'follow', 'projections', 'liveProjections', 'prompt',
+        'attachment', 'updateQueue', 'cancel', 'rename', 'fork',
+        'selectModel', 'inspect',
+      ];
+      const originals = new Map();
+
+      for (const name of filtered) {
+        const original = sessionController[name];
+        if (typeof original !== 'function') continue;
+        originals.set(name, original);
+        sessionController[name] = function filteredCall(...args) {
+          const who = identityOfPeer(this.ctx?.invocation?.peer);
+          if (who === undefined) return Reflect.apply(original, this, args);
+          const keep = (result) => {
+            // 这里读缓存而不是磁盘：list/search 是高频调用，每次都读盘撑不住。
+            // 缓存由 writeState 同步更新，所以刚认领完的对话这里立刻就能看见。
+            const state = cached;
+            if (state === null || result === null || typeof result !== 'object') return result;
+            const items = Array.isArray(result.items) ? result.items : [];
+            const visible = items.filter((item) => {
+              const id = item?.sessionId ?? item?.id;
+              return typeof id === 'string' && ownsSession(state, who, id);
+            });
+            return { ...result, items: visible };
+          };
+          const result = Reflect.apply(original, this, args);
+          return result !== null && typeof result?.then === 'function' ? result.then(keep) : keep(result);
+        };
+      }
+
+      for (const name of owned) {
+        const original = sessionController[name];
+        if (typeof original !== 'function') continue;
+        originals.set(name, original);
+        sessionController[name] = function ownedCall(...args) {
+          const who = identityOfPeer(this.ctx?.invocation?.peer);
+          if (who === undefined) return Reflect.apply(original, this, args);
+          const verdict = ownershipGuard(who, name, args);
+          if (verdict !== undefined) return name === 'follow' ? (async function* () { throw verdict; })() : Promise.reject(verdict);
+          return Reflect.apply(original, this, args);
+        };
+      }
+
+      // 谁开的对话就记在谁名下：不然新对话永远是无主的，访客也能看见。
+      const originalCreate = sessionController.create;
+      if (typeof originalCreate === 'function') {
+        originals.set('create', originalCreate);
+        sessionController.create = function createOwned(...args) {
+          const who = identityOfPeer(this.ctx?.invocation?.peer);
+          const result = Reflect.apply(originalCreate, this, args);
+          if (who === undefined) return result;
+          // 认领要**等**：不等的话刚开完的对话还是"无主"的，下一页就可能被判
+          // 成不属于自己 —— 自己刚开的对话自己读不到，这种 bug 最难查。
+          const done = async (value) => {
+            const id = value?.sessionId;
+            if (typeof id === 'string') {
+              try { await claimSession(id, who); } catch { /* 认领失败不该弄坏创建 */ }
+            }
+            return value;
+          };
+          return result !== null && typeof result?.then === 'function' ? result.then(done) : done(result);
+        };
+      }
+
+      ctx.effect(() => () => {
+        for (const [name, original] of originals) {
+          if (sessionController[name] === original) continue;
+          sessionController[name] = original;
+        }
+        originals.clear();
+      }, 'admin-gate: 会话归属');
     }
   }
 
@@ -1166,4 +1448,4 @@ export function apply(ctx) {
 }
 
 // 给单元测试用（生产代码不依赖这些导出）。
-export { guestAllows, migrate, emptyState, hasAccounts };
+export { guestAllows, migrate, emptyState, hasAccounts, identityKey, ownsSession, sessionIdOf };
