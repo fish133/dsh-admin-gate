@@ -4,6 +4,9 @@
 
 - **管理员**：输密码进入，能力全开。
 - **访客**：不输密码进入，按下发的白名单只放行部分 `/api` 端点和 agent 工具。
+- **多账号**：可以有多个管理员账号，各自密码。
+- **对话独立**：每个账号只看得到自己开的对话；访客只看得到访客自己的。
+- **无访客模式**：把访客入口整个关掉，只有管理员能进。
 
 名字就叫「管理员密码」，设置页里的分区也在这个名字下。
 
@@ -14,22 +17,52 @@
 
 | 位置 | 做什么 |
 |---|---|
+| `connection.admit` / `admitConnection` / `authorizeIndex` | 闸门自己决定"你是谁"：发一个带身份标记的 Peer（访客 / 某个账号）。不这么做访客连主界面都打不开 —— Harness 自己的 cookie 检查会先一步 401 |
 | `connection/request` | 没通过闸门的浏览器请求，`/api` 一律 401；访客模式下再按端点白名单过一遍，越界 403 |
+| `sessionController` 方法包装 | 会话方法按 `sessionId` 判归属，不是自己的拒绝或筛掉 |
 | `tools.guard()` | 访客触发的 agent 回合里，工具只放行白名单内的 |
 | `webserver/index-inject` | 页面一加载就 `GET /admin-gate/api/state`，没过闸门就整页换到闸门页 |
 | `/admin-gate/*` | 闸门页本身和它的 JSON 接口，不挂在 `/api` 下，所以不依赖 Harness 的 cookie |
 
 即使注入的那段跳转脚本被绕过，`/api` 那里的拒绝仍然在 —— 页面只是外表。
 
+## 对话框门：谁的对话谁才看得见
+
+这一节说的是 v1.2 补上的东西，也是最容易漏的一层。
+
+**光拦 `/api` 端点不够。** `session/list` 放行给访客之后，访客看到的是**所有**
+对话的标题；`session/page` 放行之后，只要知道 sessionId 就能读全文。端点名单
+管的是"能不能调这个方法"，管不了"这个方法返回的是谁的对话"。
+
+所以另有一层归属判断：
+
+| 层 | 做什么 |
+|---|---|
+| HTTP | 会话方法按参数里的 `sessionId` 判归属，不是自己的直接抛 |
+| 流（WebSocket） | `session/follow` 等流在打开时同样判一次 |
+| 列表 | `list` / `search` 不报错，**筛掉**别人的条目（不暴露"存在但你看不到"） |
+| 新建 | `create` 谁开的就记在谁名下（`sessions` 表） |
+
+归属记在状态文件的 `sessions: { "<sessionId>": "acct:<账号id>" | "guest" }`。
+
+- 没登记的老对话算"无主"，只有管理员看得见；
+- 升级到 v3 时会一次性把磁盘上已有的对话划给**最早创建的那个账号**（那些本来
+  就是它开的），之后谁开谁领。
+
 ## 状态存在哪
+
 
 `$DSH_HOME/admin-gate.json`（默认 `/root/.dsh/admin-gate.json`）：
 
 ```json
 {
-  "version": 1,
-  "password": { "salt": "...", "hash": "...", "n": 16384, "r": 8, "p": 1 },
-  "guest": { "endpoints": ["..."], "tools": ["..."] }
+  "version": 3,
+  "mode": "guest",
+  "accounts": {
+    "c84c79da5334900f": { "name": "管理员", "salt": "...", "hash": "...", "n": 16384, "r": 8, "p": 1 }
+  },
+  "sessions": { "session-abc": "acct:c84c79da5334900f" },
+  "guest": { "endpoints": ["..."], "tools": ["..."], "customized": false }
 }
 ```
 
