@@ -125,6 +125,14 @@ pnpm add link:/path/to/dsh-admin-gate
 
 ## 更新历史
 
+### v1.2.1
+- 修：插件只声明依赖 `webServer`，启动早期 `connection` 还没挂上，身份层被整段跳过
+  —— 重启后访客打 `/` 是 401、隔离失效，而手动重载插件又一切正常（这种"重启坏、
+  重载好"的 bug 最会骗过测试）
+- 修：`session/control` 全站投影流没做归属过滤 —— Harness 自己的 `allows()` 对
+  owner principal 一律放行，而我们的 Peer 全是 owner，等于它一帧都不替我们挡
+- 两处都补了回归测试（`identity.test.mjs` 22 → 30 条）
+
 ### v1.2.0
 - 修：访客**根本没有自己的身份**——Harness 的 `browserAuth` 在闸门之前就 401，
   访客只能借管理员的 cookie 进来，用的还是 owner 身份，于是管理员对话全看得见
@@ -132,7 +140,7 @@ pnpm add link:/path/to/dsh-admin-gate
   闸门自己签发带身份标记的 Peer
 - 新增归属层：状态升到 v3，`sessions` 表记录对话归属；包装 15 个会话方法按
   `sessionId` 判归属，`list` / `search` 改成筛掉而不是报错
-- 新增 `tests/identity.test.mjs`（22 条）：身份签发、归属隔离、多账号独立
+- 新增 `tests/identity.test.mjs`（30 条）：身份签发、归属隔离、多账号独立
 - 升级时自动把已有对话划给最早创建的账号
 
 ### v1.1.0
@@ -158,7 +166,7 @@ pnpm add link:/path/to/dsh-admin-gate
 | 7 | 登录没有失败限制 | 可以暴力猜密码 |
 | 8 | 状态文件非原子写 | 写到一半断电会留下半个 json |
 
-### v1.2.0
+### v1.2.0 / v1.2.1
 
 | # | 问题 | 影响 |
 |---|---|---|
@@ -166,6 +174,8 @@ pnpm add link:/path/to/dsh-admin-gate
 | 10 | 访客打开 `/` 是 401（连界面都看不到） | 访客形同不能使用 |
 | 11 | 端点白名单只管"能不能调"，不管"返回谁的" | 知道 sessionId 就能读全文 |
 | 12 | 新开的对话没有归属记录 | 访客能看到后来开的对话 |
+| 13 | 插件只声明依赖 `webServer`，启动早期拿不到 `connection` | 身份层整段被跳过：重启后访客 401、隔离失效，手动重载又正常 |
+| 14 | `session/control` 全站投影流没做归属过滤 | 白名单一旦放行 `session/*`，所有账号的会话标题都会漏出去 |
 
 ## 已知边界
 
@@ -179,7 +189,7 @@ pnpm add link:/path/to/dsh-admin-gate
 
 ```bash
 node tests/gate.test.mjs      # 47 条：闸门、多账号、模式、白名单、状态迁移
-node tests/identity.test.mjs  # 22 条：身份签发、会话归属隔离、多账号对话独立
+node tests/identity.test.mjs  # 30 条：身份签发、会话归属隔离、多账号对话独立
 ```
 
 两个都要跑。`gate.test.mjs` 里没有 `connection` / `sessionController`，所以身份与
