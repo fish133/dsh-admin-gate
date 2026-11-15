@@ -9,19 +9,14 @@ A gate in front of DeepSeek Harness — admins sign in with a password, guests e
 ## Install
 
 ```bash
-# add the repo as a profile dependency
-cd /root/.dsh/profiles/web
-pnpm add link:/path/to/dsh-admin-gate
+dsh plugin --profile web add github:fish133/dsh-admin-gate
 ```
 
-Then reference it from the profile's `dsh.profile.bundles`:
+Restart Harness after it installs (or toggle the plugin off and on in the plugins
+settings page), then visit `/admin-gate` to set the first password.
 
-```json
-"@local/dsh-admin-gate"
-```
-
-Restart Harness, or toggle `@local/dsh-admin-gate` off and on in the plugins settings
-page. Once installed, visit `/admin-gate` to set the first password.
+To install from a local checkout instead, use
+`dsh plugin --profile web add link:/path/to/dsh-admin-gate`.
 
 ## Features
 
@@ -88,29 +83,28 @@ So there is a second layer:
 | HTTP | Conversation methods check ownership against the `sessionId` in their arguments |
 | Streams (WebSocket) | `session/follow` and friends check once, at open |
 | Lists | `list` / `search` **filter** rather than refuse — never reveal "exists but you can't see it" |
-| Creation | `create` records the creator as owner |
+| Create | Whoever opens a conversation is recorded as its owner |
 
-Ownership lives in the state file as
-`sessions: { "<sessionId>": "acct:<accountId>" | "guest" }`.
+Ownership lives in the state file under `sessions: { "<sessionId>": "acct:<id>" | "guest" }`.
 
-- An unregistered old conversation counts as "unowned" — admins only
-- The v3 upgrade assigns every existing conversation to the **oldest account** (they
-  were its conversations to begin with); from then on, whoever creates one owns it
+- Unregistered legacy conversations count as unowned: only admins see them
+- Upgrading to v3 assigns every conversation already on disk to the **earliest-created
+  account** (they were its conversations), and afterwards whoever opens one claims it
 
 ## What guests get
 
 The default allowlists are deliberately conservative — they decide whether the owner's
-identity can be lent out, which is not a call the plugin should make for you:
+identity can be lent out, which is not a call this plugin should make for you:
 
-- **Read-only endpoints by default**: conversation list/history, workspace files, model
-  catalog, skill list, `settings/describe`, and so on. `session/prompt` is deliberately
-  **excluded** — allowing it lets a guest put an agent to work, and that agent runs as
-  the owner on this machine.
-- **Only `web_search` / `web_fetch` as tools.** No `read` / `bash` / `write`: `read`
-  can reach credentials under `~/.dsh`, and `bash` can run anything.
+- **Endpoints default to read-only**: conversation list/history, workspace files, the
+  model catalog, the skill list, `settings/describe`, and so on. `session/prompt` is
+  deliberately **not** included — opening it lets a guest put the agent to work, and
+  the agent runs on this machine as the owner.
+- **Tools default to `web_search` / `web_fetch` only**. No `read` / `bash` / `write`:
+  `read` can reach the credentials under `~/.dsh`, `bash` can run anything.
 
-Want guests to chat? Add `session/prompt` to the endpoint list. Want them to read
-files? Add `read`. Both are explicit choices.
+Want guests to chat? Add `session/prompt` to the endpoint list. Want them to read files?
+Add `read`. Every one of those is an explicit choice.
 
 ## Where state lives
 
@@ -121,113 +115,24 @@ files? Add `read`. Both are explicit choices.
   "version": 3,
   "mode": "guest",
   "accounts": {
-    "<id>": { "name": "Admin", "salt": "...", "hash": "...", "n": 16384, "r": 8, "p": 1, "createdAt": 0 }
+    "<id>": { "name": "admin", "salt": "...", "hash": "...", "n": 16384, "r": 8, "p": 1, "createdAt": 0 }
   },
   "sessions": { "session-abc": "acct:<id>" },
   "guest": { "endpoints": ["..."], "tools": ["..."], "customized": false }
 }
 ```
 
-- Passwords are scrypt salted hashes; no plaintext, and nothing goes into the profile
-  patch (patches are overwritten by upgrades)
-- **Forgot the password?** Delete this file and reopen `/admin-gate` to set a new one
-- Session tokens live in memory only — a Harness restart means passing the gate again
-- v1's single `password` and v2's older shape are **migrated automatically** on read
+The state file holds password hashes and the guest allowlist and is **listed in
+`.gitignore`** — do not commit it. Forgot the password? Delete the file and visit
+`/admin-gate` again to set a new one.
 
-## Changelog
-
-### v1.2.1
-- Fix: the plugin declared only `webServer`, so `connection` was not mounted yet at
-  startup and the whole identity layer was skipped — after a restart guests got 401 on
-  `/` and isolation was gone, while reloading the plugin by hand looked perfectly fine
-- Fix: the `session/control` site-wide projection stream had no ownership filter.
-  Harness's own `allows()` waves owner principals through and every Peer of ours is the
-  owner, so it never filtered a single frame for us
-- Regression tests for both (`identity.test.mjs` grew from 22 to 30 cases)
-
-### v1.2.0
-- Fix: guests had **no identity of their own** — Harness's `browserAuth` returned 401
-  before the gate ever ran, so a guest could only enter by borrowing an admin's cookie,
-  running as owner and seeing every admin conversation
-- New identity layer: wraps `connection.admit` / `admitConnection` / `authorizeIndex`;
-  the gate issues its own identity-tagged Peer
-- New ownership layer: state goes to v3 with a `sessions` map; 15 conversation methods
-  are wrapped to check `sessionId` ownership; `list` / `search` filter instead of
-  refusing
-- New `tests/identity.test.mjs` (30 cases): identity issuance, ownership isolation,
-  per-account separation
-- Existing conversations are assigned to the oldest account on upgrade
-
-### v1.1.0
-- Multiple admin accounts, each with its own password
-- No-guest mode (`admin-only` becomes the default)
-- 8 bugs fixed (see below)
-
-### v1.0.0
-- First release: admin password, guest allowlist, three modes
-
-## Fixed bugs
-
-### v1.1.0
-
-| # | Problem | Impact |
-|---|---|---|
-| 1 | Wildcard `a*b` also matched `ab` | Guests could reach endpoints not meant for them |
-| 2 | A malformed cookie (`%E4%`) threw `URIError` | One bad cookie turned the whole request into a 500 |
-| 3 | All guests shared one `guestPeer` | One guest disconnecting could take others down |
-| 4 | Tool allowlist read a stale closure Set | Allowlist edits needed a restart to apply |
-| 5 | Every request read the state file | Slow, and concurrent writes raced |
-| 6 | Guest sessions survived a password change | Old guests kept working |
-| 7 | No login failure limit | Passwords could be brute-forced |
-| 8 | State file written non-atomically | A power loss left half a JSON behind |
-
-### v1.2.0 / v1.2.1
-
-| # | Problem | Impact |
-|---|---|---|
-| 9 | Guests had no identity and borrowed the owner's | Every admin conversation was visible to guests |
-| 10 | Guests got 401 on `/` — not even the UI | Guests could not use the app at all |
-| 11 | Endpoint allowlist governed calls, not returned rows | Knowing a sessionId was enough to read it |
-| 12 | Newly created conversations had no owner | Guests could see conversations created later |
-| 13 | The plugin declared only `webServer`, so `connection` was absent early at startup | The whole identity layer was skipped: guests got 401 after a restart while a manual reload looked fine |
-| 14 | The `session/control` site-wide projection stream had no ownership filter | Once the allowlist opened up `session/*`, every account's conversation titles leaked |
-
-## Known limits
-
-- **Browser traffic only.** The local CLI and API tokens minted via `/connect` do not
-  pass through this gate — they are the owner using their own machine, not a remote guest
-- The gate page is a self-contained HTML page with its own styles; it does not follow the
-  Harness theme (it lives outside Harness)
-- Guest detection rides `AsyncLocalStorage` for "who started this call", with agent
-  ownership as a fallback. A call chain that bypasses HTTP entirely (a timer firing on
-  its own, say) is treated as the owner
-
-## Tests
+## Development
 
 ```bash
-node tests/gate.test.mjs      # 47 cases: the gate, accounts, modes, allowlists, migration
-node tests/identity.test.mjs  # 30 cases: identity issuance, ownership isolation, separation
-```
-
-Run both. `gate.test.mjs` has no `connection` or `sessionController`, so the identity and
-ownership layers are entirely skipped there — only `identity.test.mjs` actually covers
-them.
-
-## Layout
-
-```
-admin-gate/
-├── index.js                  # host half: gate, identity, ownership, gate page
-├── client.js                 # browser half: the "Admin Gate" settings section
-├── cordis.patch.yml          # bundle declaration
-├── locale/{zh,en}.json       # strings
-├── icon.svg                  # icon
-├── tests/
-│   ├── gate.test.mjs         # gate and state
-│   └── identity.test.mjs     # identity and conversation isolation
-└── README.en.md
+node tests/gate.test.mjs      # host half, against a fake ctx
+node tests/identity.test.mjs  # identity and ownership layer
 ```
 
 ## License
 
-MIT License
+MIT, see [LICENSE](LICENSE).
