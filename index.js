@@ -24,9 +24,18 @@ import { homedir } from 'node:os';
 import { AsyncLocalStorage } from 'node:async_hooks';
 
 export const name = 'admin-gate';
-// 路由挂在 webServer 上；connection / tools 都是可选的，不写进 inject，
-// 免得在没装它们的组合里整个插件不激活。
-export const inject = ['webServer'];
+/**
+ * 依赖必须写进 inject，不能只靠 `ctx.get()` 现取。
+ *
+ * 这里踩过一次：插件原来只声明 `webServer`，于是它在**启动早期**就激活了，
+ * 那时 `connection` 还没挂上来，`ctx.get('connection')` 返回 undefined，整段
+ * 身份代码被 `if` 跳过去 —— 闸门看着装好了，实际访客打 `/` 直接 401。
+ * 手动关一下再打开又会好，因为那时候 connection 早就就绪了。这种"重启后坏、
+ * 重载后好"的 bug 最容易骗过测试。
+ *
+ * 写成 inject，Cordis 会等这些服务就绪再激活本插件，顺序由框架保证。
+ */
+export const inject = ['webServer', 'connection'];
 
 const COOKIE = 'dsh-admin-gate';
 
@@ -1156,9 +1165,14 @@ export function apply(ctx) {
   const identityOfPeer = (peer) => (peer === undefined ? undefined : peerIdentity.get(peer));
 
   const connectionService = ctx.get('connection');
-  if (connectionService !== undefined
-    && typeof connectionService.admit === 'function'
-    && typeof connectionService.createPeer === 'function') {
+  if (connectionService === undefined
+    || typeof connectionService.admit !== 'function'
+    || typeof connectionService.createPeer !== 'function') {
+    // 正常情况下不会走到这里（connection 已经在 inject 里声明了）。真走到了
+    // 说明组合变了，这时候**必须**说出来：身份层没装上的闸门等于纸门，可它
+    // 表面上一切正常，不报错就没人会发现。
+    console.error('[admin-gate] 拿不到 connection 服务，身份层没有安装 —— 访客将无法进入，且身份隔离失效。');
+  } else {
     const originalAdmit = connectionService.admit;
     const originalAdmitConnection = connectionService.admitConnection;
     const originalAuthorizeIndex = connectionService.authorizeIndex;
@@ -1366,6 +1380,47 @@ export function apply(ctx) {
           };
           const result = Reflect.apply(original, this, args);
           return result !== null && typeof result?.then === 'function' ? result.then(keep) : keep(result);
+        };
+      }
+
+      // `control` 是**全站**的投影基线流，一次把所有会话的 projections 都推过来
+      // （标题、模型选择、工作量……），不是按 sessionId 取。它不在 owned 列表里，
+      // 也不该按 sessionId 判 —— 得按「这个人能看哪些 session」把帧里的键筛掉。
+      //
+      // 为什么非补不可：Harness 自己的 allows() 对 owner principal 一律放行，而
+      // 我们的 Peer 全是 owner，所以它一帧都不会替我们挡。默认白名单正好挡住了
+      // 这个端点，可白名单是主人能改的 —— 一旦放行 session/*，这里就直接漏了。
+      const originalControl = sessionController.control;
+      if (typeof originalControl === 'function') {
+        originals.set('control', originalControl);
+        sessionController.control = function controlFiltered(...args) {
+          const who = identityOfPeer(this.ctx?.invocation?.peer);
+          const source = Reflect.apply(originalControl, this, args);
+          if (who === undefined || source === null || typeof source?.next !== 'function') return source;
+          const keepBlock = (block) => {
+            const state = cached;
+            if (state === null || block === null || typeof block !== 'object') return block;
+            const values = block.value;
+            if (values === null || typeof values !== 'object') return block;
+            const projections = values.projections;
+            if (projections === null || typeof projections !== 'object') return block;
+            const visible = {};
+            for (const [sessionId, block2] of Object.entries(projections)) {
+              if (ownsSession(state, who, sessionId)) visible[sessionId] = block2;
+            }
+            return { ...block, value: { ...values, projections: visible } };
+          };
+          return (async function* filtered() {
+            for await (const frame of source) {
+              if (frame?.type === 'projection') {
+                const state = cached;
+                if (state !== null && !ownsSession(state, who, frame.sessionId)) continue;
+                yield frame;
+                continue;
+              }
+              yield keepBlock(frame);
+            }
+          })();
         };
       }
 
