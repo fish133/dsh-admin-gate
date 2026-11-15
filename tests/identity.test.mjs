@@ -70,6 +70,14 @@ const sessionController = {
     sessionCalls.push(['prompt', request.sessionId]);
     return Promise.resolve({ accepted: true });
   },
+  // 全站投影基线流：一次把**所有**会话的 projections 推过来
+  async *control() {
+    yield { type: 'baseline', value: { projections: {
+      's-admin': { asOfSeq: 1, values: { title: '管理员的秘密' } },
+      's-second': { asOfSeq: 2, values: { title: '乙的对话' } },
+    } } };
+    yield { type: 'projection', sessionId: 's-admin', key: 'title', value: '管理员的秘密', seq: 3 };
+  },
 };
 
 const listeners = new Map();
@@ -127,6 +135,12 @@ async function dispatch(peer, body) {
   const method = body.method;
   try {
     const value = await receiver[method](body.args);
+    // 流：把帧收进数组，好让测试断言"推过来了什么"
+    if (value !== null && typeof value === 'object' && typeof value[Symbol.asyncIterator] === 'function') {
+      const frames = [];
+      for await (const frame of value) frames.push(frame);
+      return { ok: true, value: { frames } };
+    }
     return { ok: true, value };
   } catch (error) {
     return { ok: false, error: error.message };
@@ -264,6 +278,76 @@ t('乙能读自己开的对话', r.body.ok === true, JSON.stringify(r.body).slic
 // 甲的对话，乙看不到
 r = await asGuest('projections', { sessionId: secondSession });
 t('访客读不到乙的对话', r.body.ok === false, r.body.error);
+
+
+// ---------- 回归：插件必须声明 connection 依赖 ----------
+// 曾经只声明 webServer，导致启动早期 ctx.get('connection') 是 undefined，
+// 身份层整段被跳过、访客 401 —— 而手动重载后又正常，测试全绿。
+t('inject 声明了 connection（否则启动早期拿不到身份层）',
+  Array.isArray(mod.inject) && mod.inject.includes('connection'), JSON.stringify(mod.inject));
+t('inject 仍声明了 webServer', Array.isArray(mod.inject) && mod.inject.includes('webServer'), JSON.stringify(mod.inject));
+
+
+// ---------------- control 流：全站投影基线也要按归属筛 ----------------
+// 这条最容易漏：Harness 自己的 allows() 对 owner principal 一律放行，
+// 而我们的 Peer 全是 owner —— 它一帧都不会替我们挡。
+const controlFrames = async (cookie) => {
+  const r = await call('/api/session', {
+    method: 'POST',
+    headers: { cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ method: 'control', args: {} }),
+  });
+  return r.body.value?.frames ?? [];
+};
+
+r = await call('/api/session', {
+  method: 'POST',
+  headers: { cookie: guestCookie, 'content-type': 'application/json' },
+  body: JSON.stringify({ method: 'control', args: {} }),
+});
+const guestFrames = r.body.value?.frames ?? [];
+const guestBaseline = guestFrames.find((f) => f?.type === 'baseline');
+const guestIds = Object.keys(guestBaseline?.value?.projections ?? {});
+t('访客的 control 基线里没有别人的会话',
+  guestIds.length === 0, JSON.stringify(guestIds));
+t('访客的 control 投影帧被丢掉',
+  guestFrames.filter((f) => f?.type === 'projection').length === 0,
+  JSON.stringify(guestFrames.map((f) => f?.type)));
+
+r = await call('/api/session', {
+  method: 'POST',
+  headers: { cookie: adminCookie, 'content-type': 'application/json' },
+  body: JSON.stringify({ method: 'control', args: {} }),
+});
+const adminFrames = r.body.value?.frames ?? [];
+const adminBaseline = adminFrames.find((f) => f?.type === 'baseline');
+const adminIds = Object.keys(adminBaseline?.value?.projections ?? {});
+t('管理员的 control 基线保留自己的会话', adminIds.includes('s-admin'), JSON.stringify(adminIds));
+// s-second 没登记归属 = 无主，按设计管理员看得见。要看"别人的"，得有一条
+// 真登记在别人名下的 —— 用乙的身份开一段，它自动记到 acct:b 名下。
+r = await call('/api/session', {
+  method: 'POST',
+  headers: { cookie: secondCookie, 'content-type': 'application/json' },
+  body: JSON.stringify({ method: 'create', args: {} }),
+});
+const secondOwned = r.body.value?.sessionId;
+t('乙开了一段对话', typeof secondOwned === 'string', secondOwned);
+
+const controlIds = async (cookie) => {
+  const res = await call('/api/session', {
+    method: 'POST',
+    headers: { cookie, 'content-type': 'application/json' },
+    body: JSON.stringify({ method: 'control', args: {} }),
+  });
+  const bl = (res.body.value?.frames ?? []).find((f) => f?.type === 'baseline');
+  return Object.keys(bl?.value?.projections ?? {});
+};
+
+const adminIds2 = await controlIds(adminCookie);
+t('甲的 control 里没有乙登记过的对话', !adminIds2.includes(secondOwned), JSON.stringify(adminIds2));
+
+const guestIds2 = await controlIds(guestCookie);
+t('访客的 control 里没有乙登记过的对话', !guestIds2.includes(secondOwned), JSON.stringify(guestIds2));
 
 server.close();
 for (const [s, l, e] of R) console.log(`${s}  ${l}${e ? '  [' + e + ']' : ''}`);
