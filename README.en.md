@@ -136,6 +136,15 @@ files? Add `read`. Both are explicit choices.
 
 ## Changelog
 
+### v1.2.1
+- Fix: the plugin declared only `webServer`, so `connection` was not mounted yet at
+  startup and the whole identity layer was skipped — after a restart guests got 401 on
+  `/` and isolation was gone, while reloading the plugin by hand looked perfectly fine
+- Fix: the `session/control` site-wide projection stream had no ownership filter.
+  Harness's own `allows()` waves owner principals through and every Peer of ours is the
+  owner, so it never filtered a single frame for us
+- Regression tests for both (`identity.test.mjs` grew from 22 to 30 cases)
+
 ### v1.2.0
 - Fix: guests had **no identity of their own** — Harness's `browserAuth` returned 401
   before the gate ever ran, so a guest could only enter by borrowing an admin's cookie,
@@ -145,7 +154,7 @@ files? Add `read`. Both are explicit choices.
 - New ownership layer: state goes to v3 with a `sessions` map; 15 conversation methods
   are wrapped to check `sessionId` ownership; `list` / `search` filter instead of
   refusing
-- New `tests/identity.test.mjs` (22 cases): identity issuance, ownership isolation,
+- New `tests/identity.test.mjs` (30 cases): identity issuance, ownership isolation,
   per-account separation
 - Existing conversations are assigned to the oldest account on upgrade
 
@@ -172,7 +181,7 @@ files? Add `read`. Both are explicit choices.
 | 7 | No login failure limit | Passwords could be brute-forced |
 | 8 | State file written non-atomically | A power loss left half a JSON behind |
 
-### v1.2.0
+### v1.2.0 / v1.2.1
 
 | # | Problem | Impact |
 |---|---|---|
@@ -180,6 +189,8 @@ files? Add `read`. Both are explicit choices.
 | 10 | Guests got 401 on `/` — not even the UI | Guests could not use the app at all |
 | 11 | Endpoint allowlist governed calls, not returned rows | Knowing a sessionId was enough to read it |
 | 12 | Newly created conversations had no owner | Guests could see conversations created later |
+| 13 | The plugin declared only `webServer`, so `connection` was absent early at startup | The whole identity layer was skipped: guests got 401 after a restart while a manual reload looked fine |
+| 14 | The `session/control` site-wide projection stream had no ownership filter | Once the allowlist opened up `session/*`, every account's conversation titles leaked |
 
 ## Known limits
 
@@ -195,7 +206,7 @@ files? Add `read`. Both are explicit choices.
 
 ```bash
 node tests/gate.test.mjs      # 47 cases: the gate, accounts, modes, allowlists, migration
-node tests/identity.test.mjs  # 22 cases: identity issuance, ownership isolation, separation
+node tests/identity.test.mjs  # 30 cases: identity issuance, ownership isolation, separation
 ```
 
 Run both. `gate.test.mjs` has no `connection` or `sessionController`, so the identity and
