@@ -9,12 +9,19 @@
 ## 安装
 
 ```bash
-dsh plugin --profile web add github:fish133/dsh-admin-gate
+# 把仓库放进 profile 的依赖里
+cd /root/.dsh/profiles/web
+pnpm add link:/path/to/dsh-admin-gate
 ```
 
-装好后重启 Harness（或在设置页的「插件」里把它关掉再打开），然后访问 `/admin-gate` 设第一个密码。
+然后在 profile 的 `package.json` 里被 `dsh.profile.bundles` 引用：
 
-想从本地副本装就换成 `dsh plugin --profile web add link:/path/to/dsh-admin-gate`。
+```json
+"@local/dsh-admin-gate"
+```
+
+重启 Harness，或者用设置页的「插件」把 `@local/dsh-admin-gate` 关掉再打开。
+装好后访问 `/admin-gate` 设第一个密码。
 
 ## 功能特性
 
@@ -111,16 +118,107 @@ dsh plugin --profile web add github:fish133/dsh-admin-gate
 }
 ```
 
-状态文件里有密码哈希与访客名单，**已经加进 `.gitignore`**，别提交。
-忘了密码：删掉这个文件，再访问 `/admin-gate` 重设。
+- 密码是 scrypt 加盐哈希，不存明文，也不进 profile patch（patch 会随升级被覆盖）
+- **忘了密码**：删掉这个文件，重新打开 `/admin-gate` 会引导重设
+- 会话 token 只在内存里，Harness 重启后要重新过闸门
+- v1 的单个 `password`、v2 的旧结构都会在读取时**自动迁移**，不用手动改
 
-## 开发
+## 更新历史
+
+### v1.2.2
+- 修：`sessionController` 和 `connection` 一样是后挂服务，插件启动时 `ctx.get()` 拿到
+  undefined，**归属隔离那一整段被静悄悄跳过** —— 重启后访客能列出、能直读管理员
+  全部 143 段对话（`/` 却是 200，看着一切正常）。同一个坑，隔一天换个服务又踩一次
+- 改成 `ctx.inject(['sessionController'], …)` 等服务就绪再包装，另加 10 秒看门狗，
+  真等不到才告警
+- 新增"服务晚到"回归测试（会真的把 controller 延后 10ms 再注入）
+
+### v1.2.1
+- 修：插件只声明依赖 `webServer`，启动早期 `connection` 还没挂上，身份层被整段跳过
+  —— 重启后访客打 `/` 是 401、隔离失效，而手动重载插件又一切正常（这种"重启坏、
+  重载好"的 bug 最会骗过测试）
+- 修：`session/control` 全站投影流没做归属过滤 —— Harness 自己的 `allows()` 对
+  owner principal 一律放行，而我们的 Peer 全是 owner，等于它一帧都不替我们挡
+- 两处都补了回归测试（`identity.test.mjs` 22 → 30 条）
+
+### v1.2.0
+- 修：访客**根本没有自己的身份**——Harness 的 `browserAuth` 在闸门之前就 401，
+  访客只能借管理员的 cookie 进来，用的还是 owner 身份，于是管理员对话全看得见
+- 新增身份层：包 `connection.admit` / `admitConnection` / `authorizeIndex`，
+  闸门自己签发带身份标记的 Peer
+- 新增归属层：状态升到 v3，`sessions` 表记录对话归属；包装 15 个会话方法按
+  `sessionId` 判归属，`list` / `search` 改成筛掉而不是报错
+- 新增 `tests/identity.test.mjs`（32 条）：身份签发、归属隔离、多账号独立
+- 升级时自动把已有对话划给最早创建的账号
+
+### v1.1.0
+- 新增多账号：多个管理员各自密码
+- 新增无访客模式（`admin-only` 成为默认）
+- 修复 8 个 bug（见下）
+
+### v1.0.0
+- 首个版本：管理员密码、访客白名单、三种模式
+
+## 已修的 bug
+
+### v1.1.0
+
+| # | 问题 | 影响 |
+|---|---|---|
+| 1 | 通配符 `a*b` 会把 `ab` 也放过去 | 访客可能拿到没打算给它的端点 |
+| 2 | 畸形 cookie（`%E4%`）会抛 `URIError` | 一个坏 cookie 就能让整个请求 500 |
+| 3 | 所有访客共用同一个 `guestPeer` | 一个访客断开可能带走别人 |
+| 4 | 工具白名单用闭包旧 Set | 改完名单不生效，要重启 |
+| 5 | 每个请求都读盘 | 慢，且并发写有竞态 |
+| 6 | 改密码后访客会话不清 | 旧访客能继续挂着 |
+| 7 | 登录没有失败限制 | 可以暴力猜密码 |
+| 8 | 状态文件非原子写 | 写到一半断电会留下半个 json |
+
+### v1.2.0 / v1.2.1 / v1.2.2
+
+| # | 问题 | 影响 |
+|---|---|---|
+| 9 | 访客没有独立身份，借用 owner 身份 | 管理员所有对话对访客可见 |
+| 10 | 访客打开 `/` 是 401（连界面都看不到） | 访客形同不能使用 |
+| 11 | 端点白名单只管"能不能调"，不管"返回谁的" | 知道 sessionId 就能读全文 |
+| 12 | 新开的对话没有归属记录 | 访客能看到后来开的对话 |
+| 13 | 插件只声明依赖 `webServer`，启动早期拿不到 `connection` | 身份层整段被跳过：重启后访客 401、隔离失效，手动重载又正常 |
+| 14 | `session/control` 全站投影流没做归属过滤 | 白名单一旦放行 `session/*`，所有账号的会话标题都会漏出去 |
+| 15 | `sessionController` 在启动早期尚未挂载，归属层整段被跳过 | 重启后访客能读到管理员全部对话，而 `/` 返回 200 毫无异常 |
+
+## 已知边界
+
+- **只在浏览器这条路上生效**。本机命令行、API token（`/connect` 换出来的）不走这道门——
+  它们本来就是主人自己在用，不是「远程访客」
+- 闸门页是自带样式的一页 HTML，不跟随 Harness 主题（它在 Harness 外面）
+- 访客判定按「这次请求是谁发起的」走 `AsyncLocalStorage`，并用 agent 归属兜底；
+  如果某个调用链完全绕开 HTTP（例如定时任务自己触发），它会像主人一样被放行
+
+## 测试
 
 ```bash
-node tests/gate.test.mjs      # host 半边（假 ctx）
-node tests/identity.test.mjs  # 身份与归属层
+node tests/gate.test.mjs      # 47 条：闸门、多账号、模式、白名单、状态迁移
+node tests/identity.test.mjs  # 32 条：身份签发、会话归属隔离、多账号对话独立
 ```
 
-## 许可
+两个都要跑。`gate.test.mjs` 里没有 `connection` / `sessionController`，所以身份与
+归属那两层在那边是整段跳过的——只有 `identity.test.mjs` 真的覆盖到。
 
-MIT，见 [LICENSE](LICENSE)。
+## 项目结构
+
+```
+admin-gate/
+├── index.js                  # host 半边：闸门、身份、归属、闸门页
+├── client.js                 # browser 半边：设置页的「管理员密码」分区
+├── cordis.patch.yml          # bundle 声明
+├── locale/{zh,en}.json       # 文案
+├── icon.svg                  # 图标
+├── tests/
+│   ├── gate.test.mjs         # 闸门与状态
+│   └── identity.test.mjs     # 身份与对话隔离
+└── README.md
+```
+
+## 开源协议
+
+MIT License
