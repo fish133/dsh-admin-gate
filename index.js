@@ -1349,8 +1349,12 @@ export function apply(ctx) {
     //
     // 为什么不去改 typert 的 resource 声明：那是生成代码里的东西，改完下次
     // Harness 升级就被盖掉了；而服务对象是我们进程里的活对象。
-    const sessionController = ctx.get('sessionController');
-    if (sessionController !== undefined) {
+    //
+    // `sessionController` 和 `connection` 一样是**后挂服务的**：插件启动早期它
+    // 还没上来，`ctx.get()` 拿到 undefined，这一整段就静悄悄地不装了。昨天
+    // 在 connection 上踩过一次，今天又在它身上踩了一次 —— 同一个坑，不同的服务。
+    // 所以这里不再"取一次"，而是等它出现；真的一直不来就喊出来。
+    const installOwnership = (sessionController) => {
       const filtered = ['list', 'search'];
       const owned = [
         'page', 'follow', 'projections', 'liveProjections', 'prompt',
@@ -1465,7 +1469,26 @@ export function apply(ctx) {
         }
         originals.clear();
       }, 'admin-gate: 会话归属');
-    }
+    };
+
+    // 等 sessionController 就绪再装。`ctx.inject` 是 Cordis 的正规等法：
+    // 服务一出现就回调，服务下线会跟着卸载。
+    const ownershipFiber = ctx.inject(['sessionController'], (sessionCtx) => {
+      const service = sessionCtx.get('sessionController') ?? sessionCtx.sessionController;
+      if (service === undefined) return;
+      installOwnership(service);
+    });
+    // 兜底：万一这个组合里根本没有 sessionController，归属层就是没装 ——
+    // 那等于所有人的对话互相可见，必须喊出来，不能安静地当没事。
+    // 注意要**等一会儿**再看：启动早期它本来就不在，立刻检查只会天天误报。
+    const ownershipWatchdog = setTimeout(() => {
+      if (ctx.get('sessionController') === undefined) {
+        console.warn('[admin-gate] 等了 10 秒仍没找到 sessionController，对话归属隔离没有安装。');
+      }
+    }, 10_000);
+    if (typeof ownershipWatchdog.unref === 'function') ownershipWatchdog.unref();
+    ctx.effect(() => () => clearTimeout(ownershipWatchdog), 'admin-gate: 归属层看门狗');
+    void ownershipFiber;
   }
 
   // ---- 6. 页面一进来先看门开着没有 ------------------------------------
