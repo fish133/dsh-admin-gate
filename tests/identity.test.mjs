@@ -90,6 +90,12 @@ const ctx = {
     if (key === 'sessionController') return sessionController;
     return undefined;
   },
+  // Cordis 的等依赖入口：服务已在就直接回调，否则等服务出现。
+  inject(names, callback) {
+    const ready = names.every((n) => ctx.get(n) !== undefined);
+    if (ready) callback(ctx);
+    return { dispose() {} };
+  },
   webServer: {
     register(r) { routes.push(r); return () => {}; },
     tapIndex() { return () => {}; },
@@ -348,6 +354,43 @@ t('甲的 control 里没有乙登记过的对话', !adminIds2.includes(secondOwn
 
 const guestIds2 = await controlIds(guestCookie);
 t('访客的 control 里没有乙登记过的对话', !guestIds2.includes(secondOwned), JSON.stringify(guestIds2));
+
+
+// ---------- 回归：归属层必须等 sessionController 就绪 ----------
+// 这条对应"重启后隔离失效、重载后又正常"那个 bug。测试里的假 ctx 一开始就
+// 有 sessionController，天然测不出顺序问题，所以单独验一次"晚到"的情形。
+const lateCtx = {
+  store: {
+    connection,
+    webServer: { register: () => () => {}, tapIndex: () => () => {}, renderIndex: (x) => x },
+  },
+  on() { return () => {}; },
+  effect(fn) { return fn(); },
+  get(key) { return lateCtx.store[key]; },
+  webServer: { register: () => () => {}, tapIndex: () => () => {}, renderIndex: (x) => x },
+  inject(names, callback) {
+    // 模拟 Cordis：服务已在就立刻回调，不在就排到"稍后"再回调
+    const ready = names.every((n) => lateCtx.store[n] !== undefined);
+    if (ready) { callback(lateCtx); return { dispose() {} }; }
+    setTimeout(() => {
+      for (const n of names) if (lateCtx.store[n] === undefined) return;
+      callback(lateCtx);
+    }, 10);
+    return { dispose() {} };
+  },
+};
+// sessionController 晚到：先不给
+const lateController = { list: async () => ({ items: [{ sessionId: 's-late' }] }) };
+const lateMod = await import(new URL('../index.js', import.meta.url).href + '?late=1');
+process.env.DSH_HOME = await mkdtemp(join(tmpdir(), 'gate-late-'));
+lateMod.apply(lateCtx);
+t('晚到的 sessionController 一开始没被包装',
+  lateController.list.toString().includes('native') || !('__wrapped' in lateController));
+lateCtx.store.sessionController = lateController;
+await new Promise((r) => setTimeout(r, 60));
+t('sessionController 出现后被装上归属层',
+  lateController.list.toString().includes('filteredCall') || lateController.list.__gateWrapped === true,
+  String(lateController.list).slice(0, 60));
 
 server.close();
 for (const [s, l, e] of R) console.log(`${s}  ${l}${e ? '  [' + e + ']' : ''}`);
