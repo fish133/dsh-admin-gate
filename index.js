@@ -1089,10 +1089,41 @@ export function apply(ctx) {
     return sendJson(res, 404, { ok: false, error: 'not found' });
   };
 
+  // 闸门路由自己的 Host / Origin 准入。
+  //
+  // `webServer.register` 挂出来的路由**不经过** DSH 的准入检查（那是
+  // Connection 给 /api 用的那一套）。也就是说，/admin-gate 这一组路由默认是
+  // 裸的：任何人从任意网页都能对它发跨站请求（CSRF），或者用 DNS rebinding
+  // 把别的域名指到这台机器上来打。
+  //
+  // 对闸门页来说这不是小事：`/admin-gate/api/login` 是免鉴权就能打的，一旦
+  // 被跨站调用，攻击页可以让受害者浏览器**替它登录**（cookie 会落进受害者
+  // 浏览器），也能拿 login 的响应时间/状态当密码的 oracle 来爆破。
+  //
+  // 所以这里手动补上 Connection 用的同一套判断（`isTrusted`：Host 必须是本机
+  // 回环/已信任域，Sec-Fetch-Site 不能是 cross-site，Origin 必须与 Host 同源）。
+  // 用 isTrusted 而不是 requestRejection：后者还包含"必须已登录"的判断，而
+  // 闸门页**本来就要给没登录的人看**，身份由我们自己的 cookie 决定。
+  const fence = (req, res) => {
+    const connectionService = ctx.get('connection');
+    if (connectionService === undefined || typeof connectionService.isTrusted !== 'function') return true;
+    let trusted = false;
+    try {
+      trusted = connectionService.isTrusted(req) === true;
+    } catch {
+      trusted = false;
+    }
+    if (trusted) return true;
+    // 不告诉对方是哪一条不过（Host 还是 Origin），只给一个干脆的 403。
+    sendJson(res, 403, { ok: false, error: 'bad-origin', message: '这个请求不是从本机页面发起的。' });
+    return false;
+  };
+
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
     path: ROUTE,
     handler: (req, res) => {
+      if (!fence(req, res)) return;
       Promise.resolve(handleGate(req, res)).catch((error) => {
         if (res.headersSent) { res.destroy(); return; }
         sendJson(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) });
