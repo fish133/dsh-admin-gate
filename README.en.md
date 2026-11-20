@@ -136,6 +136,20 @@ files? Add `read`. Both are explicit choices.
 
 ## Changelog
 
+### v1.3.0
+- Security fix: the gate routes were mounted with `webServer.register`, which **skips
+  DSH's Host / Origin admission** — effectively open to any web page. Since
+  `/admin-gate/api/login` needs no authentication, a cross-site call could log a victim
+  in as the attacker (the cookie lands in the victim's browser) and turn login into a
+  brute-force oracle
+- Every gate request now passes `connection.isTrusted` first (Host must be loopback or a
+  trusted authority, `Sec-Fetch-Site` must not be cross-site, Origin must match Host);
+  otherwise 403
+- Used `isTrusted` rather than `requestRejection`: the latter also requires an existing
+  login, and the gate page must be visible to people who have not logged in yet
+- 6 new CSRF cases (identity 32 → 38)
+- Thanks to [@fksyly](https://github.com/fksyly) for catching this during the merge review
+
 ### v1.2.2
 - Fix: `sessionController`, like `connection`, is mounted late. At startup `ctx.get()`
   returned undefined and the **entire ownership layer was silently skipped** — after a
@@ -164,7 +178,7 @@ files? Add `read`. Both are explicit choices.
 - New ownership layer: state goes to v3 with a `sessions` map; 15 conversation methods
   are wrapped to check `sessionId` ownership; `list` / `search` filter instead of
   refusing
-- New `tests/identity.test.mjs` (32 cases): identity issuance, ownership isolation,
+- New `tests/identity.test.mjs` (38 cases): identity issuance, ownership isolation,
   per-account separation
 - Existing conversations are assigned to the oldest account on upgrade
 
@@ -191,7 +205,7 @@ files? Add `read`. Both are explicit choices.
 | 7 | No login failure limit | Passwords could be brute-forced |
 | 8 | State file written non-atomically | A power loss left half a JSON behind |
 
-### v1.2.0 / v1.2.1 / v1.2.2
+### v1.2.0 / v1.2.1 / v1.2.2 / v1.3.0
 
 | # | Problem | Impact |
 |---|---|---|
@@ -202,6 +216,7 @@ files? Add `read`. Both are explicit choices.
 | 13 | The plugin declared only `webServer`, so `connection` was absent early at startup | The whole identity layer was skipped: guests got 401 after a restart while a manual reload looked fine |
 | 14 | The `session/control` site-wide projection stream had no ownership filter | Once the allowlist opened up `session/*`, every account's conversation titles leaked |
 | 15 | `sessionController` was not mounted yet at startup, so the ownership layer was skipped entirely | After a restart a guest could read every admin conversation while `/` returned 200 |
+| 16 | Gate routes skipped DSH's Host / Origin admission | Any web page could call `/admin-gate/api/*` cross-site, including the unauthenticated login |
 
 ## Known limits
 
@@ -217,7 +232,7 @@ files? Add `read`. Both are explicit choices.
 
 ```bash
 node tests/gate.test.mjs      # 47 cases: the gate, accounts, modes, allowlists, migration
-node tests/identity.test.mjs  # 32 cases: identity issuance, ownership isolation, separation
+node tests/identity.test.mjs  # 38 cases: identity issuance, ownership isolation, separation
 ```
 
 Run both. `gate.test.mjs` has no `connection` or `sessionController`, so the identity and
