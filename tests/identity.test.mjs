@@ -42,6 +42,13 @@ const connection = {
     if (req.headers.cookie?.includes('dsh-harness-token=yes')) return true;
     res.writeHead(401); res.end('unauthorized'); return false;
   },
+  // 闸门路由自己补的准入：模拟 DSH 的 Host / Origin 检查
+  isTrusted(req) {
+    if (req.headers['sec-fetch-site'] === 'cross-site') return false;
+    const origin = req.headers.origin;
+    if (origin === undefined) return true;
+    return origin === `http://127.0.0.1:${server.address().port}`;
+  },
 };
 
 /** 假 sessionController：记录调用，返回固定数据。 */
@@ -391,6 +398,36 @@ await new Promise((r) => setTimeout(r, 60));
 t('sessionController 出现后被装上归属层',
   lateController.list.toString().includes('filteredCall') || lateController.list.__gateWrapped === true,
   String(lateController.list).slice(0, 60));
+
+
+// ---------------- 闸门路由的 Host/Origin 准入（CSRF） ----------------
+// 背景：webServer.register 挂的路由不过 DSH 的准入检查，闸门页因此可被跨站
+// 调用。/admin-gate/api/login 免鉴权，被 CSRF 命中就等于让别人替你登录。
+r = await fetch(base + '/admin-gate/api/state', {
+  headers: { 'sec-fetch-site': 'cross-site' },
+});
+t('跨站请求打闸门 API 被 403', r.status === 403, r.status);
+
+r = await fetch(base + '/admin-gate/api/state', {
+  headers: { origin: 'https://evil.example.com' },
+});
+t('外站 Origin 打闸门 API 被 403', r.status === 403, r.status);
+
+r = await fetch(base + '/admin-gate/api/state', {
+  headers: { origin: base },
+});
+t('同源 Origin 放行', r.status === 200, r.status);
+
+r = await fetch(base + '/admin-gate/api/login', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'sec-fetch-site': 'cross-site' },
+  body: JSON.stringify({ mode: 'guest' }),
+});
+t('跨站的 login 被 403（CSRF 关键一条）', r.status === 403, r.status);
+t('跨站 login 没有下发 cookie', r.headers.get('set-cookie') === null, r.headers.get('set-cookie'));
+
+r = await fetch(base + '/admin-gate/api/state', { headers: {} });
+t('不带 Origin 的本机请求仍然放行', r.status === 200, r.status);
 
 server.close();
 for (const [s, l, e] of R) console.log(`${s}  ${l}${e ? '  [' + e + ']' : ''}`);
