@@ -125,6 +125,17 @@ pnpm add link:/path/to/dsh-admin-gate
 
 ## 更新历史
 
+### v1.3.0
+- 修（安全）：闸门路由用的是 `webServer.register`，**不经过 DSH 的 Host / Origin 准入**，
+  等于对任意网页开放。`/admin-gate/api/login` 免鉴权，被跨站调用就能让别人替受害者
+  登录（cookie 落进受害者浏览器），也能把登录取代成密码的爆破 oracle
+- 现在每个闸门请求先过一遍 `connection.isTrusted`（Host 必须是本机或已信任域、
+  `Sec-Fetch-Site` 不能是 cross-site、Origin 必须与 Host 同源），不过就 403
+- 用 `isTrusted` 而不是 `requestRejection`：后者还包含"必须已登录"，而闸门页本来
+  就要给没登录的人看
+- 新增 6 条 CSRF 用例（identity 32 → 38）
+- 感谢 [@fksyly](https://github.com/fksyly) 在合并 PR 时指出这一点
+
 ### v1.2.2
 - 修：`sessionController` 和 `connection` 一样是后挂服务，插件启动时 `ctx.get()` 拿到
   undefined，**归属隔离那一整段被静悄悄跳过** —— 重启后访客能列出、能直读管理员
@@ -148,7 +159,7 @@ pnpm add link:/path/to/dsh-admin-gate
   闸门自己签发带身份标记的 Peer
 - 新增归属层：状态升到 v3，`sessions` 表记录对话归属；包装 15 个会话方法按
   `sessionId` 判归属，`list` / `search` 改成筛掉而不是报错
-- 新增 `tests/identity.test.mjs`（32 条）：身份签发、归属隔离、多账号独立
+- 新增 `tests/identity.test.mjs`（38 条）：身份签发、归属隔离、多账号独立
 - 升级时自动把已有对话划给最早创建的账号
 
 ### v1.1.0
@@ -174,7 +185,7 @@ pnpm add link:/path/to/dsh-admin-gate
 | 7 | 登录没有失败限制 | 可以暴力猜密码 |
 | 8 | 状态文件非原子写 | 写到一半断电会留下半个 json |
 
-### v1.2.0 / v1.2.1 / v1.2.2
+### v1.2.0 / v1.2.1 / v1.2.2 / v1.3.0
 
 | # | 问题 | 影响 |
 |---|---|---|
@@ -185,6 +196,7 @@ pnpm add link:/path/to/dsh-admin-gate
 | 13 | 插件只声明依赖 `webServer`，启动早期拿不到 `connection` | 身份层整段被跳过：重启后访客 401、隔离失效，手动重载又正常 |
 | 14 | `session/control` 全站投影流没做归属过滤 | 白名单一旦放行 `session/*`，所有账号的会话标题都会漏出去 |
 | 15 | `sessionController` 在启动早期尚未挂载，归属层整段被跳过 | 重启后访客能读到管理员全部对话，而 `/` 返回 200 毫无异常 |
+| 16 | 闸门路由不过 DSH 的 Host / Origin 准入 | 任意网页可跨站调用 `/admin-gate/api/*`，包括免鉴权的 login |
 
 ## 已知边界
 
@@ -198,7 +210,7 @@ pnpm add link:/path/to/dsh-admin-gate
 
 ```bash
 node tests/gate.test.mjs      # 47 条：闸门、多账号、模式、白名单、状态迁移
-node tests/identity.test.mjs  # 32 条：身份签发、会话归属隔离、多账号对话独立
+node tests/identity.test.mjs  # 38 条：身份签发、会话归属隔离、多账号对话独立
 ```
 
 两个都要跑。`gate.test.mjs` 里没有 `connection` / `sessionController`，所以身份与
